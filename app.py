@@ -1,5 +1,7 @@
 import streamlit as st
-import google.generativeai as genai
+import streamlit.components.v1 as components
+from google import genai
+from google.genai import types as genai_types
 import fitz  # PyMuPDF — replaces pdf2image + Poppler
 import json
 import os
@@ -15,6 +17,71 @@ from concurrent.futures import ThreadPoolExecutor
 # ---------------- CONFIGURATION ----------------
 CHECKPOINT_DIR = "checkpoints"
 
+
+def _safe_response_text(response) -> str | None:
+    try:
+        txt = response.text
+        if txt is not None and txt.strip():
+            return txt
+    except Exception:
+        pass
+
+    try:
+        for cand in (response.candidates or []):
+            for part in (cand.content.parts or []):
+                if getattr(part, "thought", False):
+                    continue
+                t = getattr(part, "text", None)
+                if t and t.strip():
+                    return t
+    except Exception:
+        pass
+
+    try:
+        reason = response.candidates[0].finish_reason
+        print(f"  [empty response] finish_reason={reason}")
+    except Exception:
+        pass
+    return None
+
+
+def _call_gemini(client, model_name: str, contents: list, cfg) -> str | None:
+    response = client.models.generate_content(
+        model=model_name, contents=contents, config=cfg,
+    )
+    return _safe_response_text(response)
+
+
+def _make_page_configs():
+    cfgs = []
+
+    try:
+        cfgs.append(genai_types.GenerateContentConfig(
+            temperature=0, max_output_tokens=65536))
+    except Exception as _e:
+        print(f"[cfg] plain failed: {_e}")
+
+    try:
+        cfgs.append(genai_types.GenerateContentConfig(
+            temperature=0, max_output_tokens=65536,
+            response_mime_type="application/json"))
+    except Exception as _e:
+        print(f"[cfg] json-mime failed: {_e}")
+
+    for budget in [1024, 8192, 24576]:
+        try:
+            cfgs.append(genai_types.GenerateContentConfig(
+                temperature=0, max_output_tokens=65536,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=budget)))
+        except Exception as _e:
+            print(f"[cfg] thinking budget={budget} failed: {_e}")
+
+    if not cfgs:
+        cfgs = [genai_types.GenerateContentConfig(
+            temperature=0, max_output_tokens=65536)]
+
+    return cfgs
+
 st.set_page_config(
     page_title="Ultra-Fast Extraction: PDF to JSON",
     page_icon="⚡",
@@ -23,7 +90,6 @@ st.set_page_config(
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ── Canonical field order ──
 FIELD_ORDER = [
     "questionid", "question", "option1", "option2", "option3", "option4",
     "Answer", "Explanation", "course", "subjectname", "chapter", "practice",
@@ -32,23 +98,40 @@ FIELD_ORDER = [
 ]
 
 # ================================================================
-# PyMuPDF PDF HELPERS (no Poppler needed)
+# PyMuPDF PDF HELPERS
 # ================================================================
 
-def pdf_page_to_png_bytes(pdf_path: str, page_num: int, dpi: int = 200) -> bytes:
-    """Render a single PDF page to PNG bytes using PyMuPDF."""
+EXTRACTION_DPI = 350
+
+def pdf_page_to_png_bytes(pdf_path: str, page_num: int, dpi: int = EXTRACTION_DPI) -> bytes:
+    """Render PDF page to PNG. FIX: guard against out-of-range page_num."""
     doc = fitz.open(pdf_path)
+    # ── FIX 1: guard page_num out of range ──
+    if page_num >= len(doc):
+        doc.close()
+        raise IndexError(f"Page index {page_num} out of range — document has {len(doc)} page(s)")
     page = doc[page_num]
     zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    png_bytes = pix.tobytes("png")
+    mat  = fitz.Matrix(zoom, zoom)
+    pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
     doc.close()
-    return png_bytes
+    try:
+        import cv2, numpy as np
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        img = cv2.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
+        kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+        img = cv2.filter2D(img, -1, kernel)
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        l = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(l)
+        img = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
+        _, buf = cv2.imencode('.png', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        return buf.tobytes()
+    except Exception:
+        return pix.tobytes("png")
 
 
 def compute_template_image_hashes(pdf_path: str) -> set:
-    """Return MD5 hashes of images that appear on 3+ pages (logos, headers, template graphics)."""
     try:
         doc = fitz.open(pdf_path)
         hash_page_count: dict[str, int] = {}
@@ -71,109 +154,576 @@ def compute_template_image_hashes(pdf_path: str) -> set:
         return set()
 
 
+# ================================================================
+# IMAGE EXTRACTION
+# ================================================================
+
+_IMG_FIELDS = ["question", "Explanation", "option1", "option2", "option3", "option4"]
+
+_DIAGRAM_KWS = [
+    'figure', 'fig.', 'fig ', 'diagram', 'image', 'shown', 'given', 'above', 'below',
+    'graph', 'circuit', 'spinner', 'marble', 'bag', 'chart', 'map', 'plot',
+    'shape', 'triangle', 'rectangle', 'circle', 'polygon', 'structure', 'illustration',
+    'चित्र', 'आकृति', 'दिया गया', 'नीचे', 'ऊपर', 'आरेख', 'ग्राफ', 'परिपथ',
+]
+
+
 def extract_page_embedded_images(pdf_path: str, page_num: int,
                                   skip_hashes: set | None = None) -> list[dict]:
-    """Extract all embedded diagram/image objects from a PDF page."""
+    """FIX: guard page_num out of range."""
     doc = fitz.open(pdf_path)
+    # ── FIX 1 (also here): guard page_num ──
+    if page_num >= len(doc):
+        doc.close()
+        return []
     page = doc[page_num]
-    images = []
+    seen_xrefs: set[int] = set()
+
     for img_info in page.get_images(full=True):
         xref = img_info[0]
+        if xref > 0:
+            seen_xrefs.add(xref)
+
+    try:
+        for info in page.get_image_info(xrefs=True):
+            xref = info.get("xref", 0)
+            if xref and xref > 0:
+                seen_xrefs.add(xref)
+    except Exception:
+        pass
+
+    xref_ypos: dict[int, float] = {}
+    try:
+        for info in page.get_image_info(hashes=False):
+            xref = info.get("xref", 0)
+            if xref and xref > 0:
+                bbox = info.get("bbox", [0, 0, 0, 0])
+                xref_ypos[xref] = float(bbox[1]) if len(bbox) >= 4 else 0.0
+    except Exception:
+        pass
+
+    images = []
+    for xref in seen_xrefs:
         try:
             img_data = doc.extract_image(xref)
-            raw = img_data["image"]
-            if skip_hashes:
-                img_hash = hashlib.md5(raw).hexdigest()
-                if img_hash in skip_hashes:
-                    continue
-            w = img_data.get("width", 0)
-            h = img_data.get("height", 0)
-            if w < 80 or h < 50:
+            raw      = img_data["image"]
+            ext      = img_data.get("ext", "png").lower()
+            w        = img_data.get("width",  0)
+            h        = img_data.get("height", 0)
+            cs_n     = img_data.get("colorspace", 3)
+
+            if skip_hashes and hashlib.md5(raw).hexdigest() in skip_hashes:
                 continue
-            ext = img_data.get("ext", "png")
-            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
-            b64 = base64.b64encode(raw).decode()
+            if w < 40 or h < 30:
+                continue
+            if _is_useless_image(raw):
+                continue
+
+            if ext in ("jpg", "jpeg") and cs_n == 3:
+                mime = "image/jpeg"
+                b64  = base64.b64encode(raw).decode()
+            elif ext == "png" and cs_n in (1, 3):
+                mime = "image/png"
+                b64  = base64.b64encode(raw).decode()
+            else:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.colorspace and pix.colorspace.n != 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                if pix.alpha:
+                    pix = fitz.Pixmap(pix, 0)
+                raw  = pix.tobytes("png")
+                mime = "image/png"
+                b64  = base64.b64encode(raw).decode()
+
             images.append({
                 "mime_type": mime,
                 "image_base64": b64,
                 "data_uri": f"data:{mime};base64,{b64}",
+                "y_pos": xref_ypos.get(xref, 9999.0),
             })
         except Exception:
             pass
+
     doc.close()
     return images
 
 
-def _img_tag(data_uri: str, width: int = 280) -> str:
-    """Build an HTML img tag for embedding a diagram."""
-    return f'<img src="{data_uri}" style="max-width:{width}px;display:block;margin:6px 0"/>'
+def _is_useless_image(raw_bytes: bytes) -> bool:
+    try:
+        pix = fitz.Pixmap(raw_bytes)
+        if pix.width < 10 or pix.height < 10:
+            return True
+        samples = pix.samples
+        n = pix.n
+        total = len(samples) // n
+        step = max(1, total // 400)
+        dark_count = 0
+        sampled = 0
+        for i in range(0, total, step):
+            px = samples[i*n : i*n + min(3, n)]
+            if len(px) >= 3:
+                brightness = (px[0] + px[1] + px[2]) / 3
+                if brightness < 180:
+                    dark_count += 1
+                sampled += 1
+        if sampled == 0:
+            return False
+        dark_ratio = dark_count / sampled
+        if dark_ratio < 0.005:
+            return True
+        if dark_ratio > 0.98:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _inflate_rect(r: fitz.Rect, d: float) -> fitz.Rect:
+    return fitz.Rect(r.x0 - d, r.y0 - d, r.x1 + d, r.y1 + d)
+
+
+def _cluster_rects(rects: list, gap: int = 25) -> list:
+    clusters: list[fitz.Rect] = []
+    for rect in rects:
+        expanded = _inflate_rect(rect, gap)
+        merged = False
+        for i, cluster in enumerate(clusters):
+            if expanded.intersects(cluster):
+                clusters[i] = clusters[i] | rect
+                merged = True
+                break
+        if not merged:
+            clusters.append(fitz.Rect(rect))
+    return clusters
+
+
+def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
+    try:
+        doc  = fitz.open(pdf_path)
+        # ── FIX 1 (also here): guard page_num ──
+        if page_num >= len(doc):
+            doc.close()
+            return []
+        page = doc[page_num]
+        crop_mat = fitz.Matrix(3.0, 3.0)
+        images: list[dict] = []
+        captured: list[fitz.Rect] = []
+
+        def _already_covered(r: fitz.Rect) -> bool:
+            return any(
+                cap.intersect(r).get_area() / max(r.get_area(), 1) > 0.5
+                for cap in captured
+            )
+
+        def _render(clip: fitz.Rect, y_pos: float):
+            clip = clip & page.rect
+            if clip.width < 10 or clip.height < 10:
+                return
+            pix = page.get_pixmap(matrix=crop_mat, clip=clip, colorspace=fitz.csRGB)
+            raw = pix.tobytes("png")
+            if _is_useless_image(raw):
+                return
+            b64 = base64.b64encode(raw).decode()
+            images.append({
+                "mime_type": "image/png",
+                "image_base64": b64,
+                "data_uri": f"data:image/png;base64,{b64}",
+                "y_pos": y_pos,
+            })
+            captured.append(clip)
+
+        drawings = page.get_drawings()
+        if drawings:
+            raw_rects = [fitz.Rect(d["rect"]) for d in drawings
+                         if d.get("rect") and max(fitz.Rect(d["rect"]).width,
+                                                   fitz.Rect(d["rect"]).height) >= 5]
+
+            clusters: list[fitz.Rect] = []
+            cluster_counts: list[int] = []
+            for rect in raw_rects:
+                exp = _inflate_rect(rect, 20)
+                merged = False
+                for i, c in enumerate(clusters):
+                    if exp.intersects(c):
+                        clusters[i] = clusters[i] | rect
+                        cluster_counts[i] += 1
+                        merged = True
+                        break
+                if not merged:
+                    clusters.append(fitz.Rect(rect))
+                    cluster_counts.append(1)
+
+            for cr, cnt in zip(clusters, cluster_counts):
+                if cr.width < 15 or cr.height < 15:
+                    continue
+                if cr.get_area() < 300:
+                    continue
+                if cnt < 2:
+                    continue
+                aspect = cr.width / max(cr.height, 1)
+                if aspect > 3.0 and cr.height < 60:
+                    continue
+                if _already_covered(cr):
+                    continue
+                clip = fitz.Rect(
+                    max(0, cr.x0 - 30), max(0, cr.y0 - 8),
+                    min(page.rect.width,  cr.x1 + 30),
+                    min(page.rect.height, cr.y1 + 8)
+                )
+                _render(clip, cr.y0)
+
+        try:
+            for annot in page.annots():
+                ar = fitz.Rect(annot.rect)
+                if ar.width >= 15 and ar.height >= 15 and not _already_covered(ar):
+                    _render(_inflate_rect(ar, 8), ar.y0)
+        except Exception:
+            pass
+
+        doc.close()
+        images.sort(key=lambda x: x.get("y_pos", 0))
+        return images
+    except Exception:
+        return []
+
+
+def extract_all_page_images(pdf_path: str, page_num: int,
+                             skip_hashes: set | None = None) -> list[dict]:
+    raster = extract_page_embedded_images(pdf_path, page_num, skip_hashes)
+    vector = extract_vector_diagram_regions(pdf_path, page_num)
+    deduped_vector = [v for v in vector
+                      if not any(abs(v.get("y_pos", 0) - r.get("y_pos", 9999)) < 30
+                                 for r in raster)]
+    combined = raster + deduped_vector
+    combined.sort(key=lambda x: x.get("y_pos", 9999))
+    return combined
+
+
+# ================================================================
+# DIAGRAM INJECTION HELPERS
+# ================================================================
+
+def _normalize_diagram_refs(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'\bdiagram\[(\d+)\]',               r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[diagram_(\d+)\]',                 r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[DIAGRAM(\d+)\]',                  r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[image[_ ]?(\d+)\]',               r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<!\[)\bdiagram\s+(\d+)\b(?!\])', r'[DIAGRAM_\1]', text, flags=re.IGNORECASE)
+    return text
+
+
+def _img_tag(data_uri: str, width: int = 340) -> str:
+    return (f'<img src="{data_uri}" '
+            f'style="max-width:{width}px;width:100%;height:auto;'
+            f'display:block;margin:8px auto;border-radius:2px"/>')
+
+
+def _cleanup_placeholders(q: dict) -> dict:
+    for field in _IMG_FIELDS:
+        if field in q and q[field]:
+            q[field] = re.sub(r'\[DIAGRAM_?\d*\]', '', q[field])
+            q[field] = re.sub(r'\[DIAGRAM\]',       '', q[field])
+    return q
 
 
 def inject_diagrams_into_question(q: dict, page_images: list[dict]) -> dict:
-    """Embed extracted page images into the correct question field."""
+    for field in _IMG_FIELDS:
+        if field in q and q[field]:
+            q[field] = _normalize_diagram_refs(q[field])
+
     if not page_images:
         q.pop("diagram_placements", None)
         q.pop("diagram_image_indices", None)
-        return q
+        return _cleanup_placeholders(q)
 
-    diagram_injected = False
-
-    for field in ["question", "Explanation", "option1", "option2", "option3", "option4"]:
-        if field in q and q[field]:
-            matches = re.findall(r'\[DIAGRAM_(\d+)\]', q[field])
-            for match in matches:
-                idx = int(match)
-                if 0 <= idx < len(page_images):
-                    tag = _img_tag(page_images[idx]["data_uri"])
-                    q[field] = q[field].replace(f'[DIAGRAM_{idx}]', tag)
-                    diagram_injected = True
-                else:
-                    q[field] = q[field].replace(f'[DIAGRAM_{idx}]', '')
-
-    placements = q.pop("diagram_placements", [])
-    indices_fallback = q.pop("diagram_image_indices", [])
-
-    if placements and not diagram_injected:
-        for p in placements:
-            idx = p.get("image_index", 0)
-            field = p.get("field", "Explanation")
-            position = p.get("position", "end")
-            if 0 <= idx < len(page_images) and field in q:
-                tag = _img_tag(page_images[idx]["data_uri"])
-                if position == "start":
-                    q[field] = tag + "\n" + (q.get(field) or "")
-                elif position == "replace" and "[DIAGRAM]" in q.get(field, ""):
-                    q[field] = q[field].replace("[DIAGRAM]", tag)
-                else:
-                    q[field] = (q.get(field) or "") + "\n" + tag
-                diagram_injected = True
-
-    if not diagram_injected and indices_fallback:
-        question_text = q.get("question", "").lower()
-        explanation_text = q.get("Explanation", "").lower()
-        # Hindi + English diagram keywords
-        diagram_keywords = [
-            'figure', 'fig.', 'diagram', 'image', 'shown below', 'given below', 'above figure',
-            'चित्र', 'आकृति', 'दिया गया', 'नीचे दिया', 'ऊपर दिया', 'आरेख'
-        ]
-
-        for idx in indices_fallback:
+    injected_indices: set[int] = set()
+    for field in _IMG_FIELDS:
+        if field not in q or not q[field]:
+            continue
+        for match in re.findall(r'\[DIAGRAM_(\d+)\]', q[field]):
+            idx = int(match)
             if 0 <= idx < len(page_images):
-                if any(keyword in question_text for keyword in diagram_keywords):
-                    tag = _img_tag(page_images[idx]["data_uri"], width=300)
-                    q["question"] = (q.get("question") or "") + f"\n{tag}"
-                    diagram_injected = True
-                elif any(keyword in explanation_text for keyword in diagram_keywords):
-                    tag = _img_tag(page_images[idx]["data_uri"], width=300)
-                    q["Explanation"] = (q.get("Explanation") or "") + f"\n{tag}"
-                    diagram_injected = True
+                tag = _img_tag(page_images[idx]["data_uri"])
+                q[field] = q[field].replace(f'[DIAGRAM_{idx}]', tag)
+                injected_indices.add(idx)
+            else:
+                q[field] = q[field].replace(f'[DIAGRAM_{idx}]', '')
 
-    for field in ["question", "Explanation", "option1", "option2", "option3", "option4"]:
-        if field in q and q[field]:
-            q[field] = re.sub(r'\[DIAGRAM_\d+\]', '', q[field])
-            q[field] = re.sub(r'\[DIAGRAM\]', '', q[field])
+    placements       = q.pop("diagram_placements", []) or []
+    indices_fallback = q.pop("diagram_image_indices", []) or []
 
-    return q
+    for p in placements:
+        idx      = p.get("image_index", 0)
+        field    = p.get("field", "Explanation")
+        position = p.get("position", "end")
+        if 0 <= idx < len(page_images) and field in q and idx not in injected_indices:
+            tag = _img_tag(page_images[idx]["data_uri"])
+            if position == "start":
+                q[field] = tag + "\n" + (q.get(field) or "")
+            elif position == "replace" and "[DIAGRAM]" in q.get(field, ""):
+                q[field] = q[field].replace("[DIAGRAM]", tag)
+            else:
+                q[field] = (q.get(field) or "") + "\n" + tag
+            injected_indices.add(idx)
+
+    q_text   = (q.get("question", "")    or "").lower()
+    exp_text = (q.get("Explanation", "") or "").lower()
+    for idx in indices_fallback:
+        if 0 <= idx < len(page_images) and idx not in injected_indices:
+            tag = _img_tag(page_images[idx]["data_uri"], width=300)
+            if any(kw in q_text for kw in _DIAGRAM_KWS):
+                q["question"]    = (q.get("question")    or "") + f"\n{tag}"
+                injected_indices.add(idx)
+            elif any(kw in exp_text for kw in _DIAGRAM_KWS):
+                q["Explanation"] = (q.get("Explanation") or "") + f"\n{tag}"
+                injected_indices.add(idx)
+
+    return _cleanup_placeholders(q)
+
+# ================================================================
+# LIVE PREVIEW HELPERS
+# ================================================================
+
+def _fmt_latex(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ''
+    text = re.sub(r'<img[^>]*>', '[📷]', text, flags=re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\\\\\((.+?)\\\\\)', r'$\1$', text, flags=re.DOTALL)
+    text = re.sub(r'\\\\\[(.+?)\\\\\]', r'$$\1$$', text, flags=re.DOTALL)
+    return text
+
+
+_LADDER_DIVISOR_RE = re.compile(r'^\s*\d+\s*\|')
+_LADDER_SEP_RE     = re.compile(r'^\s*\|[_\s]+$')
+_LADDER_EMPTY_DIV  = re.compile(r'^\s*\|')
+_LADDER_FINAL_RE   = re.compile(r'^\s+\d[\d\s]+$')
+_LADDER_ROW_PARSE  = re.compile(r'^(\s*\d*)\s*\|\s*(.+)$')
+
+
+def _lcm_ladder_to_html(ladder_lines: list) -> str:
+    rows       = []
+    final_nums = None
+
+    for line in ladder_lines:
+        stripped = line.strip()
+        if _LADDER_SEP_RE.match(stripped):
+            continue
+        m = _LADDER_ROW_PARSE.match(stripped)
+        if m:
+            rows.append((m.group(1).strip(), m.group(2)))
+        elif _LADDER_FINAL_RE.match(line):
+            final_nums = line.strip()
+
+    if not rows:
+        return ''
+
+    VL = '2px solid #111'
+    HL = '1.5px solid #111'
+
+    S_D = (f'border:none;border-right:{VL};border-bottom:{HL};'
+           f'text-align:right;padding:3px 6px 3px 4px;vertical-align:middle;'
+           f'font-weight:bold;min-width:20px')
+    S_N = (f'border:none;border-bottom:{HL};'
+           f'padding:3px 10px 3px 8px;white-space:pre;vertical-align:middle')
+
+    tbl = ('<table class="lcm-ladder-t" style="border-collapse:collapse;'
+           'font-family:\'Courier New\',Courier,monospace;font-size:14px;'
+           'line-height:1.9;margin:8px 0">')
+
+    for div, nums in rows:
+        de = div.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+        ne = nums.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+        tbl += f'<tr><td style="{S_D}">{de}</td><td style="{S_N}">{ne}</td></tr>'
+
+    if final_nums is not None:
+        fe = final_nums.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+        SF_D = 'border:none;padding:3px 6px 3px 4px;min-width:20px'
+        SF_N = 'border:none;padding:3px 10px 3px 8px;white-space:pre;vertical-align:middle'
+        tbl += f'<tr><td style="{SF_D}"></td><td style="{SF_N}">{fe}</td></tr>'
+
+    tbl += '</table>'
+    return tbl
+
+
+def _md_table_to_html(text: str) -> str:
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    lines = text.split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if '|' in line and stripped.startswith('|') and not _LADDER_SEP_RE.match(stripped):
+            table_lines = []
+            while i < len(lines) and '|' in lines[i] and lines[i].strip().startswith('|'):
+                table_lines.append(lines[i])
+                i += 1
+            rows = [r for r in table_lines if not re.match(r'^\s*\|[\s\-|:]+\|\s*$', r)]
+            if rows:
+                html = '<table class="qtable" style="border-collapse:collapse;margin:8px 0">'
+                for ri, row in enumerate(rows):
+                    cells = [c.strip() for c in row.strip().strip('|').split('|')]
+                    if ri == 0:
+                        html += ('<tr>' + ''.join(
+                            f'<th style="border:1px solid #333;padding:5px 10px;'
+                            f'background:#dbeafe;font-weight:bold;text-align:center">{c}</th>'
+                            for c in cells) + '</tr>')
+                    else:
+                        html += ('<tr>' + ''.join(
+                            f'<td style="border:1px solid #333;padding:5px 10px;'
+                            f'text-align:left;vertical-align:middle">{c}</td>'
+                            for c in cells) + '</tr>')
+                html += '</table>'
+                out.append(html)
+            continue
+
+        if _LADDER_DIVISOR_RE.match(stripped):
+            ladder_lines = []
+            while i < len(lines):
+                s = lines[i]
+                ss = s.strip()
+                if (_LADDER_DIVISOR_RE.match(ss) or
+                        _LADDER_SEP_RE.match(ss) or
+                        _LADDER_EMPTY_DIV.match(ss) or
+                        (ladder_lines and _LADDER_FINAL_RE.match(s))):
+                    ladder_lines.append(s)
+                    i += 1
+                elif ss == '' and ladder_lines:
+                    break
+                else:
+                    break
+            if len(ladder_lines) >= 2:
+                out.append(_lcm_ladder_to_html(ladder_lines))
+            else:
+                out.extend(ladder_lines)
+            continue
+
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
+def _normalize_html_table(table_html: str) -> str:
+    head = table_html[:120].lower()
+    if 'lcm-ladder-t' in head:
+        return table_html
+    if 'class=' not in head:
+        return table_html.replace('<table', '<table class="ltable"', 1)
+    if 'qtable' not in head and 'ltable' not in head and 'lcm-table' not in head:
+        return re.sub(r'class="', 'class="ltable ', table_html, count=1, flags=re.IGNORECASE)
+    return table_html
+
+
+_KEEP_RE = re.compile(
+    r'(<img\b[^>]*?>'
+    r'|<table\b[^>]*?>.*?</table\s*>'
+    r'|<pre\b[^>]*?>.*?</pre\s*>)',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def _clean_for_html(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ''
+    text = _md_table_to_html(text)
+    segments = _KEEP_RE.split(text)
+    result = []
+    for seg in segments:
+        if _KEEP_RE.match(seg):
+            if seg.lower().startswith('<table'):
+                seg = _normalize_html_table(seg)
+            result.append(seg)
+        else:
+            s = seg
+            s = re.sub(r'<br\s*/?>', '\n', s, flags=re.IGNORECASE)
+            s = re.sub(r'<[^>]+>', '', s)
+            s = re.sub(r'\\\\\((.+?)\\\\\)', r'\\(\1\\)', s, flags=re.DOTALL)
+            s = re.sub(r'\\\\\[(.+?)\\\\\]', r'\\[\1\\]', s, flags=re.DOTALL)
+            s = s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            s = s.replace('\n', '<br>')
+            result.append(s)
+    return ''.join(result)
+
+
+def _build_preview_html(questions: list) -> str:
+    if not questions:
+        return '<p style="color:#888;padding:16px;font-family:sans-serif">Waiting for questions…</p>'
+    body_parts = []
+    for q in questions:
+        qid  = q.get('questionid', '?')
+        qtxt = _clean_for_html(str(q.get('question', '')))
+        opts_html = ''
+        for i in range(1, 5):
+            opt = q.get(f'option{i}', '')
+            if opt:
+                lbl = chr(64 + i)
+                opts_html += (
+                    f'<div class="opt">'
+                    f'<span class="lbl">({lbl})</span>&nbsp;{_clean_for_html(str(opt))}'
+                    f'</div>'
+                )
+        ans = q.get('Answer', '')
+        exp = q.get('Explanation', '')
+        ans_html = f'<div class="ans">&#x2705; <b>Answer:</b> {ans}</div>' if ans else ''
+        exp_html = (
+            f'<div class="exp">&#x1F4A1; <b>Explanation:</b> {_clean_for_html(str(exp))}</div>'
+            if exp else ''
+        )
+        body_parts.append(
+            f'<div class="qblock">'
+            f'<div class="qtext"><b>Q{qid}.</b>&nbsp;{qtxt}</div>'
+            f'<div class="opts">{opts_html}</div>'
+            f'{ans_html}{exp_html}'
+            f'</div>'
+        )
+    body = '\n'.join(body_parts)
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">\n'
+        '<script>\n'
+        'window.MathJax = {\n'
+        '  tex: {\n'
+        '    inlineMath: [["\\\\(","\\\\)"]],\n'
+        '    displayMath: [["\\\\[","\\\\]"]],\n'
+        '    processEscapes: true\n'
+        '  },\n'
+        '  options: { skipHtmlTags: ["script","noscript","style","textarea"] }\n'
+        '};\n'
+        '</script>\n'
+        '<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>\n'
+        '<style>\n'
+        'body{font-family:"Times New Roman",serif;font-size:14px;line-height:1.8;color:#111;background:#fff;padding:12px;margin:0}\n'
+        '.qblock{margin-bottom:20px;padding:10px 14px;border-left:3px solid #2563eb;background:#f8fafc;border-radius:3px}\n'
+        '.qtext{margin-bottom:8px}.opts{margin-left:18px}.opt{margin:4px 0}\n'
+        '.lbl{font-weight:bold;color:#374151}\n'
+        '.ans{margin-top:8px;color:#15803d;font-size:13px}\n'
+        '.exp{margin-top:6px;color:#374151;font-size:13px}\n'
+        'table{border-collapse:collapse;margin:8px 0;max-width:100%;font-size:13px;font-family:"Times New Roman",serif}\n'
+        'table td,table th{border:1px solid #444;padding:5px 10px;vertical-align:middle;text-align:center}\n'
+        'table th{background:#dbeafe;font-weight:bold;color:#1e3a8a}\n'
+        'table tr:nth-child(even) td{background:#f8fafc}\n'
+        'table.lcm-table td:first-child,.lcm-div{border-right:2.5px solid #000!important;background:#eef2ff;font-weight:bold;min-width:30px;text-align:center}\n'
+        'table.lcm-table td{min-width:38px;text-align:center;padding:4px 8px}\n'
+        'table.lcm-table tr:last-child td{border-top:2px solid #111}\n'
+        'table.qtable td,table.qtable th,table.ltable td,table.ltable th{text-align:left}\n'
+        'table.match-col td:first-child,table.match-col th:first-child{border-right:2px solid #555}\n'
+        'img{max-width:100%;height:auto;display:block;margin:6px auto;border-radius:2px}\n'
+        '.img-row{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;margin:6px 0}\n'
+        '.img-row img{max-width:calc(50% - 4px);flex:0 1 auto;margin:0}\n'
+        '.compare-wrap{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin:8px 0}\n'
+        '.compare-wrap>*{flex:1 1 auto;min-width:180px}\n'
+        'mjx-container[display="true"]{display:block;margin:6px 0;overflow-x:auto}\n'
+        '.MathJax{font-size:1em!important}\n'
+        'table.lcm-ladder-t{border-collapse:collapse}'
+        '\n'
+        '</style></head><body>\n'
+        + body +
+        '\n</body></html>'
+    )
+
 
 # ================================================================
 # SECTION CONFIG HELPERS
@@ -200,7 +750,8 @@ def save_checkpoint(filename, page_results, total_pages):
     checkpoint = {
         "total_pages": total_pages,
         "completed_pages": {
-            str(i): data for i, data in enumerate(page_results) if data is not None
+            str(i): data for i, data in enumerate(page_results)
+            if data is not None and len(data) > 0
         }
     }
     with open(get_checkpoint_path(filename), "w", encoding="utf-8") as f:
@@ -254,17 +805,19 @@ def convert_dollar_to_latex(text):
 def remove_base64_images(text):
     if not text or not isinstance(text, str):
         return text
-    text = re.sub(r'<img\s+[^>]*src=["\']data:[^"\']*["\'][^>]*/?>', '[IMAGE]',
-                  text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+', '', text)
-    return text.strip()
+    text = re.sub(
+        r'(?<!src=["\'])(?<!src=)data:image/[^;]+;base64,[A-Za-z0-9+/=]{100,}',
+        '', text
+    )
+    return text
 
 
 def newline_to_br(text):
-    """Replace all \\n newlines with <br> tags for HTML rendering."""
     if not text or not isinstance(text, str):
         return text
-    text = re.sub(r'<br\s*/?>', '\n', text)  # normalise any existing <br> → \n first
+    if '<table' in text.lower():
+        return text
+    text = re.sub(r'<br\s*/?>', '\n', text)
     text = text.replace('\n', '<br>')
     return text
 
@@ -273,12 +826,10 @@ def clean_explanation_prefix(text):
     if not text or not isinstance(text, str):
         return text
     text = text.strip()
-    # English prefixes
     prefix_pattern = re.compile(
         r'^(?:Ans(?:wer)?\.?\s*:?\s*(?:\([A-Da-d]\))?\s*|Sol(?:ution)?\.?\s*:?\s*)',
         re.IGNORECASE
     )
-    # Hindi prefixes
     hindi_prefix_pattern = re.compile(
         r'^(?:उत्तर\s*:?\s*|हल\s*:?\s*|समाधान\s*:?\s*|व्याख्या\s*:?\s*)',
         re.UNICODE
@@ -382,10 +933,96 @@ def fix_previous_year_field(py_val: str) -> str:
 
 
 # ================================================================
-# SUBTOPIC AUTO-FILL — Hindi + English keywords
+# SUBTOPIC AUTO-FILL
 # ================================================================
 
-def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) -> str:
+_SUBTOPIC_HINDI_MAP = {
+    "Laws of Motion": "गति के नियम",
+    "Work Energy Power": "कार्य ऊर्जा और शक्ति",
+    "Gravitation": "गुरुत्वाकर्षण",
+    "Current Electricity": "विद्युत धारा",
+    "Electrostatics": "स्थिरवैद्युतिकी",
+    "Magnetism": "चुंबकत्व",
+    "Waves": "तरंगें",
+    "Optics": "प्रकाशिकी",
+    "Thermodynamics": "ऊष्मागतिकी",
+    "Semiconductors": "अर्धचालक",
+    "Atoms and Nuclei": "परमाणु और नाभिक",
+    "Friction": "घर्षण",
+    "Rotational Motion": "घूर्णन गति",
+    "Oscillations": "दोलन",
+    "Fluid Mechanics": "तरल यांत्रिकी",
+    "Kinematics": "गतिकी",
+    "Units and Measurements": "मात्रक और मापन",
+    "Magnetic Effect of Current": "विद्युत धारा का चुंबकीय प्रभाव",
+    "Electromagnetic Induction": "विद्युत चुम्बकीय प्रेरण",
+    "AC Circuits": "प्रत्यावर्ती धारा परिपथ",
+    "Dual Nature of Matter": "पदार्थ की द्वैत प्रकृति",
+    "Communication Systems": "संचार व्यवस्था",
+    "Ray Optics": "किरण प्रकाशिकी",
+    "Wave Optics": "तरंग प्रकाशिकी",
+    "Mole Concept": "मोल संकल्पना",
+    "Chemical Equilibrium": "रासायनिक साम्य",
+    "Acids Bases and Salts": "अम्ल क्षार और लवण",
+    "Electrochemistry": "विद्युत रसायन",
+    "Organic Chemistry": "कार्बनिक रसायन",
+    "Periodic Table": "आवर्त सारणी",
+    "Chemical Bonding": "रासायनिक बंधन",
+    "Chemical Kinetics": "रासायनिक बलगतिकी",
+    "Order of Reaction": "अभिक्रिया की कोटि",
+    "Thermochemistry": "ऊष्मा रसायन",
+    "Solutions": "विलयन",
+    "Solid State": "ठोस अवस्था",
+    "Surface Chemistry": "पृष्ठ रसायन",
+    "Coordination Compounds": "उपसहसंयोजक यौगिक",
+    "Polymers": "बहुलक",
+    "Biomolecules": "जैव अणु",
+    "Integration": "समाकलन",
+    "Differentiation": "अवकलन",
+    "Limits and Continuity": "सीमा और सातत्य",
+    "Matrices and Determinants": "आव्यूह और सारणिक",
+    "Vectors": "सदिश",
+    "Probability": "प्रायिकता",
+    "Conic Sections": "शंकु परिच्छेद",
+    "Sequences and Series": "अनुक्रम और श्रेणी",
+    "Trigonometry": "त्रिकोणमिति",
+    "Complex Numbers": "सम्मिश्र संख्याएँ",
+    "Sets Relations Functions": "समुच्चय संबंध और फलन",
+    "Straight Lines": "सरल रेखाएँ",
+    "Binomial Theorem": "द्विपद प्रमेय",
+    "Statistics": "सांख्यिकी",
+    "Mathematical Reasoning": "गणितीय विवेचन",
+    "3D Geometry": "त्रिविमीय ज्यामिति",
+    "Differential Equations": "अवकल समीकरण",
+    "Relations and Functions": "संबंध और फलन",
+    "Inverse Trigonometry": "प्रतिलोम त्रिकोणमिति",
+    "Linear Programming": "रैखिक प्रोग्रामन",
+    "Cell Biology": "कोशिका जीवविज्ञान",
+    "Photosynthesis": "प्रकाश संश्लेषण",
+    "Respiration": "श्वसन",
+    "Genetics": "आनुवंशिकी",
+    "Evolution": "विकास",
+    "Ecology": "पारिस्थितिकी",
+    "Endocrine System": "अंतःस्रावी तंत्र",
+    "Digestive System": "पाचन तंत्र",
+    "Nervous System": "तंत्रिका तंत्र",
+    "Reproduction": "जनन",
+    "Plant Physiology": "पादप शरीर क्रिया विज्ञान",
+    "Human Health and Disease": "मानव स्वास्थ्य और रोग",
+    "Biotechnology": "जैव प्रौद्योगिकी",
+    "Biodiversity": "जैव विविधता",
+    "Microbes": "सूक्ष्मजीव",
+}
+
+
+def _get_subtopic_in_language(subtopic_en: str, is_hindi: bool) -> str:
+    if not is_hindi:
+        return subtopic_en
+    return _SUBTOPIC_HINDI_MAP.get(subtopic_en, subtopic_en)
+
+
+def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str,
+                                  is_hindi: bool = False) -> str:
     existing = _s(q.get("subtopic"))
     if existing:
         return existing
@@ -394,11 +1031,12 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) 
     chapter_lower = user_chapter.lower() if user_chapter else ""
     subject_lower = user_subject.lower() if user_subject else ""
 
-    # Physics (Hindi + English keywords)
     if "physics" in subject_lower or "phy" in subject_lower or "भौतिक" in subject_lower:
         kw_map = [
-            (["newton", "force", "friction", "motion", "inertia", "momentum",
-              "न्यूटन", "बल", "घर्षण", "गति", "जड़त्व", "संवेग"], "Laws of Motion"),
+            (["friction", "rough", "slipping", "sliding", "coefficient of friction",
+              "घर्षण", "खुरदरा", "फिसलन"], "Friction"),
+            (["newton", "force", "motion", "inertia", "momentum",
+              "न्यूटन", "बल", "गति", "जड़त्व", "संवेग"], "Laws of Motion"),
             (["work", "energy", "power", "kinetic", "potential", "conservative",
               "कार्य", "ऊर्जा", "शक्ति", "गतिज", "स्थितिज"], "Work Energy Power"),
             (["gravitation", "gravity", "orbital", "escape velocity", "satellite",
@@ -422,11 +1060,12 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) 
         ]
         for keywords, subtopic in kw_map:
             if any(kw in question_text for kw in keywords):
-                return subtopic
+                return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Chemistry (Hindi + English)
     elif "chemistry" in subject_lower or "chem" in subject_lower or "रसायन" in subject_lower:
         kw_map = [
+            (["order of reaction", "rate law", "half life", "first order", "zero order",
+              "अभिक्रिया की कोटि", "दर नियम", "अर्ध आयु"], "Order of Reaction"),
             (["mole", "avogadro", "stoichiometry", "मोल", "अवोगाद्रो"], "Mole Concept"),
             (["equilibrium", "le chatelier", "साम्य", "ले-शातेलिए"], "Chemical Equilibrium"),
             (["acid", "base", "ph", "buffer", "अम्ल", "क्षार", "बफर"], "Acids Bases and Salts"),
@@ -446,9 +1085,8 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) 
         ]
         for keywords, subtopic in kw_map:
             if any(kw in question_text for kw in keywords):
-                return subtopic
+                return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Mathematics (Hindi + English)
     elif "math" in subject_lower or "maths" in subject_lower or "गणित" in subject_lower:
         kw_map = [
             (["integrate", "integral", "∫", "समाकल", "एकीकरण"], "Integration"),
@@ -468,9 +1106,8 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) 
         ]
         for keywords, subtopic in kw_map:
             if any(kw in question_text for kw in keywords):
-                return subtopic
+                return _get_subtopic_in_language(subtopic, is_hindi)
 
-    # Biology (Hindi + English)
     elif "biology" in subject_lower or "bio" in subject_lower or "जीव" in subject_lower:
         kw_map = [
             (["cell", "mitochondria", "nucleus", "कोशिका", "माइटोकॉन्ड्रिया", "केन्द्रक"], "Cell Biology"),
@@ -487,7 +1124,7 @@ def infer_subtopic_from_question(q: dict, user_subject: str, user_chapter: str) 
         ]
         for keywords, subtopic in kw_map:
             if any(kw in question_text for kw in keywords):
-                return subtopic
+                return _get_subtopic_in_language(subtopic, is_hindi)
 
     if chapter_lower and len(chapter_lower) > 4:
         return user_chapter.strip()
@@ -542,12 +1179,11 @@ def text_continues_naturally(prev_text, next_text):
         'then', 'also', 'if', 'when', 'where', 'which', 'that', 'this', 'these',
         'those', 'its', 'their', 'from', 'with', 'without', 'by', 'for', 'of',
         'to', 'in', 'on', 'at', 'since', 'because', 'while', 'although',
-        # Hindi continuation words
         'और', 'या', 'लेकिन', 'इसलिए', 'अतः', 'यदि', 'जब', 'जहाँ', 'जो',
         'यह', 'वह', 'इस', 'उस', 'से', 'के', 'की', 'को', 'में', 'पर'
     ]
     first_word = next_start.split()[0].lower() if next_start.split() else ""
-    ends_mid = prev_end[-1] not in '.!?।'  # Added Hindi danda
+    ends_mid = prev_end[-1] not in '.!?।'
     is_continuation = (
         ends_mid or
         first_word in continuation_words or
@@ -576,7 +1212,18 @@ _ANS_BLOCK_RE = re.compile(
 )
 
 _Q_NUMBER_RE = re.compile(
-    r'(?:^|\n)\s*(\d+[\.\)]\s+|\([ivxIVX\d]+\)\s+|Q\.?\s*\d+[\.\)]\s*)',
+    r'(?:^|\n)\s*(\d+[\.\)]\s+)',
+    re.MULTILINE
+)
+
+_SUBPART_RE = re.compile(
+    r'(?:^|\n)\s*(?:'
+    r'[a-d][\.\)]\s+'
+    r'|\([a-d]\)\s+'
+    r'|\([ivxIVX]+\)\s+'
+    r'|[ivx]+[\.\)]\s+'
+    r'|\(\d+\)\s+'
+    r')',
     re.MULTILINE
 )
 
@@ -587,6 +1234,10 @@ def split_combined_questions(q):
         return [q]
     if not _NEW_Q_AFTER_ANS_RE.search(question_text):
         return [q]
+
+    if _SUBPART_RE.search(question_text):
+        return [q]
+
     q_starts = [m.start() for m in _Q_NUMBER_RE.finditer(question_text)]
     if len(q_starts) <= 1:
         return [q]
@@ -624,7 +1275,6 @@ def split_combined_questions(q):
 
 
 def _s(val):
-    """Safe strip — handles None/non-string values."""
     return (val or "").strip() if isinstance(val, (str, type(None))) else str(val).strip()
 
 
@@ -861,7 +1511,7 @@ def normalize_question_type(q_type_raw):
     if "true" in lower or "false" in lower or "सत्य" in lower or "असत्य" in lower:
         return "True/False"
     elif "assertion" in lower or "कथन" in lower:
-        return "Assertion and Reasoning Questions ( A & R )"
+        return "Assertion and Reasoning Questions ( A& R )"
     elif "match" in lower or "मिलान" in lower:
         return "Match the Column Question"
     elif "case" in lower or "प्रकरण" in lower:
@@ -915,7 +1565,7 @@ def enforce_question_type_rules(q):
 
     elif q_type in (
         "Subjective",
-        "Assertion and Reasoning Questions ( A & R )",
+        "Assertion and Reasoning Questions ( A& R )",
         "Match the Column Question",
         "Case Based Questions (CBQ)",
     ):
@@ -935,6 +1585,71 @@ def apply_field_order(q):
     return ordered
 
 
+_ANY_TABLE_RE = re.compile(
+    r'(<table\b[^>]*>.*?</table\s*>)',
+    re.IGNORECASE | re.DOTALL
+)
+
+_SOLUTION_SNEAK_RE = re.compile(
+    r'(?:<br\s*/?>|\n|\s{2,})\s*'
+    r'(?:'
+    r'sol(?:ution)?\.?\s*[:\-→]?|'
+    r'ans(?:wer)?\.?\s*[:\-→]?|'
+    r'explanation\s*[:\-→]?|'
+    r'lcm\s*[=:]|hcf\s*[=:]|'
+    r'∴\s*lcm|∴\s*hcf|'
+    r'therefore[,\s]|hence[,\s]|thus[,\s]|'
+    r'उत्तर\s*[:\-]?|हल\s*[:\-]?|व्याख्या\s*[:\-]?'
+    r')',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def fix_misplaced_tables(q):
+    q_type = q.get("question_type", "")
+    if "Match" in q_type:
+        return q
+
+    question_text = q.get("question", "")
+    if not question_text or not isinstance(question_text, str):
+        return q
+
+    extra_parts = []
+    clean_q = question_text
+
+    if '<table' in clean_q.lower():
+        tables_found = _ANY_TABLE_RE.findall(clean_q)
+        if tables_found:
+            clean_q = _ANY_TABLE_RE.sub('', clean_q)
+            extra_parts.extend(tables_found)
+
+    _ladder_in_q = re.search(r'(?:<br>|\n|\s{2,})\s*\d+\s*\|', clean_q)
+    if _ladder_in_q and _ladder_in_q.start() > 10:
+        ladder_tail = clean_q[_ladder_in_q.start():]
+        clean_q = clean_q[:_ladder_in_q.start()].strip()
+        if ladder_tail.strip():
+            extra_parts.append(ladder_tail.strip())
+
+    sol_match = _SOLUTION_SNEAK_RE.search(clean_q)
+    if sol_match and sol_match.start() > 15:
+        solution_tail = clean_q[sol_match.start():].strip()
+        clean_q = clean_q[:sol_match.start()].strip()
+        if solution_tail:
+            extra_parts.insert(0, solution_tail)
+
+    if not extra_parts:
+        return q
+
+    clean_q = re.sub(r'(<br\s*/?>\s*){2,}', '<br>', clean_q).strip()
+    clean_q = re.sub(r'\s{2,}', ' ', clean_q).strip()
+
+    existing_exp = (q.get("Explanation", "") or "").strip()
+    rescued = '\n'.join(p.strip() for p in extra_parts if p.strip())
+    q["Explanation"] = (rescued + '\n' + existing_exp).strip() if existing_exp else rescued
+    q["question"] = clean_q
+    return q
+
+
 # ================================================================
 # UNIFIED CLEAN_QUESTION
 # ================================================================
@@ -942,7 +1657,6 @@ def clean_question(q, page_images=None,
                    user_subject="", user_course="", user_class="",
                    user_chapter="", user_practice="", user_book="",
                    is_hindi=False):
-    """Full post-processing pipeline for a single extracted question."""
     math_fields     = ["question", "option1", "option2", "option3", "option4", "Explanation"]
     metadata_fields = ["subjectname", "chapter", "practice", "subtopic", "medium",
                        "difficulty", "question_type", "course"]
@@ -955,10 +1669,8 @@ def clean_question(q, page_images=None,
     q["question_type"] = normalize_question_type(q.get("question_type") or "MCQs")
     q["question_bucket"] = normalize_question_bucket(q.get("question_bucket") or "")
 
-    # Set medium based on Hindi flag
-    q["medium"] = "English" if is_hindi else q.get("medium", "English")
+    q["medium"] = "Hindi" if is_hindi else "English"
 
-    # ── FIX: Extract previous_year from question text ──
     existing_py = fix_previous_year_field(_s(q.get("previous_year")))
     if not existing_py:
         q_text = _s(q.get("question"))
@@ -979,7 +1691,6 @@ def clean_question(q, page_images=None,
 
     if "question" in q:
         q["question"] = scrub_references_from_question(q["question"])
-        q["question"] = remove_base64_images(q["question"])
 
     for field in list(q.keys()):
         if isinstance(q[field], str):
@@ -987,13 +1698,15 @@ def clean_question(q, page_images=None,
 
     if "Explanation" in q:
         q["Explanation"] = clean_explanation_prefix(q["Explanation"])
+        if q["Explanation"] and isinstance(q["Explanation"], str):
+            q["Explanation"] = re.sub(
+                r'<(?!img\b|/img\b|table\b|/table\b|tr\b|/tr\b|td\b|/td\b|th\b|/th\b|br\b|div\b|/div\b)[^>]+>',
+                '', q["Explanation"]
+            )
 
     for field in math_fields:
         if field in q:
             q[field] = convert_dollar_to_latex(q[field])
-
-    if "question" in q:
-        q["question"] = remove_base64_images(q["question"])
 
     if "Answer" in q:
         options = {
@@ -1010,11 +1723,7 @@ def clean_question(q, page_images=None,
 
     q = enforce_question_type_rules(q)
 
-    if page_images:
-        q = inject_diagrams_into_question(q, page_images)
-    else:
-        q.pop("diagram_placements", None)
-        q.pop("diagram_image_indices", None)
+    q = inject_diagrams_into_question(q, page_images or [])
 
     if user_subject:  q["subjectname"] = user_subject
     if user_course:   q["course"]      = user_course
@@ -1023,13 +1732,14 @@ def clean_question(q, page_images=None,
     q["practice"] = user_practice if user_practice else q.get("practice", "")
     if user_book:     q["book"]        = user_book
 
-    # Force medium override
-    q["medium"] = "Hindi" if is_hindi else q.get("medium", "English")
+    q["medium"] = "Hindi" if is_hindi else "English"
 
     if not _s(q.get("subtopic")):
-        inferred = infer_subtopic_from_question(q, user_subject, user_chapter)
+        inferred = infer_subtopic_from_question(q, user_subject, user_chapter, is_hindi=is_hindi)
         if inferred:
             q["subtopic"] = inferred
+
+    q = fix_misplaced_tables(q)
 
     br_fields = ["question", "option1", "option2", "option3", "option4", "Explanation"]
     for field in br_fields:
@@ -1105,15 +1815,25 @@ def clean_json_response(text):
         except Exception:
             return None
 
+    def _only_dicts(lst):
+        if not isinstance(lst, list):
+            return None
+        dicts = [x for x in lst if isinstance(x, dict)]
+        return dicts if dicts else None
+
     start_idx = text.find('[')
     end_idx   = text.rfind(']')
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         result = _try_parse(text[start_idx:end_idx + 1])
         if result and isinstance(result, list):
-            return result
+            clean = _only_dicts(result)
+            if clean:
+                return clean
         result = _try_parse(text[start_idx:])
         if result and isinstance(result, list):
-            return result
+            clean = _only_dicts(result)
+            if clean:
+                return clean
 
     obj_start = text.find('{')
     obj_end   = text.rfind('}')
@@ -1187,12 +1907,17 @@ def stitch_split_questions_enhanced(page_results):
             page_results[page_idx] = page
 
         for page_idx in range(num_pages - 1):
+            # ── FIX 2: guard empty page list before accessing [-1] or [0] ──
             if not page_results[page_idx]:
                 continue
             next_idx = page_idx + 1
             while next_idx < num_pages and not page_results[next_idx]:
                 next_idx += 1
             if next_idx >= num_pages:
+                continue
+
+            # ── FIX 2: double-check both lists are non-empty ──
+            if not page_results[page_idx] or not page_results[next_idx]:
                 continue
 
             last_q  = page_results[page_idx][-1]
@@ -1254,13 +1979,9 @@ def extract_continuation_fragment(pdf_path, page_index, prev_last_q, api_key, mo
                                   user_chapter, user_practice, user_book,
                                   skip_hashes=None, is_hindi=False):
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        client = genai.Client(api_key=api_key)
         img_bytes = pdf_page_to_png_bytes(pdf_path, page_index, dpi=200)
-        page_images = extract_page_embedded_images(pdf_path, page_index, skip_hashes=skip_hashes)
+        page_images = extract_all_page_images(pdf_path, page_index, skip_hashes=skip_hashes)
 
         prev_q_text = str(prev_last_q.get("question", ""))[:500]
         prev_q_expl = str(prev_last_q.get("Explanation", ""))[:300]
@@ -1270,6 +1991,8 @@ def extract_continuation_fragment(pdf_path, page_index, prev_last_q, api_key, mo
             "Do NOT translate to English. Preserve all Devanagari script.\n\n"
             if is_hindi else ""
         )
+
+        medium_val = "Hindi" if is_hindi else "English"
 
         prompt = f"""
 You are recovering a MISSING answer/solution for an incomplete question.
@@ -1289,12 +2012,28 @@ STRICT RULES:
 4. Extract EVERY line of the solution — do not skip any steps.
 5. Convert all math to LaTeX: inline \\\\( ... \\\\), display \\\\[ ... \\\\]
 6. If answer letter found (A/B/C/D), map: A→1, B→2, C→3, D→4
-7. IMPORTANT — previous_year: Look for references like (Example-1), (Exercise-7.1-8), JEE Main 2024, etc.
+7. IMPORTANT — previous_year: Look for references like (Example-1), (Exercise-7.1-8), JEE Main 2024,CBSE 2025, CBSE, NCERT etc.
+8. LCM/HCF LADDER RULE (most critical):
+   If the solution has a prime factorisation / division ladder, write it as PLAIN TEXT:
+   2 | 15  20  25
+     |___________
+   2 | 15  10  25
+     |___________
+   3 | 15   5  25
+     |___________
+   5 |  5   5  25
+     |___________
+   5 |  1   1   5
+     |___________
+       1   1   1
+   Rules: "divisor | numbers" for each step, "  |___" separator after each row,
+   "    1  1  1" (indented, no pipe) for the final row. Use PLAIN TEXT — NO HTML table.
+   For OTHER tables (data/frequency/match-column): use HTML <table class="ltable" style="border-collapse:collapse"> with <td style="border:1px solid #333;padding:5px 10px">.
 
 Return ONLY this JSON:
 {{
   "Answer": "<1/2/3/4 or 1/0 for True/False or numeric, or empty if not found>",
-  "Explanation": "<exact verbatim solution text from the image, every step>",
+  "Explanation": "<exact verbatim solution text from the image, every step — tables as HTML>",
   "question": "<verbatim continuation of question text if it continues here, else empty>",
   "option1": "<verbatim continuation of option A if split, else empty>",
   "option2": "<verbatim continuation of option B if split, else empty>",
@@ -1306,10 +2045,17 @@ Return ONLY this JSON:
 If nothing related to this question appears on this page, return: {{}}
 """
 
-        for attempt in range(3):
+        for attempt, cfg in enumerate(_make_page_configs()[:3]):
             try:
-                response = model.generate_content([prompt, {'mime_type': 'image/png', 'data': img_bytes}])
-                text = response.text.strip()
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, genai_types.Part.from_bytes(data=img_bytes, mime_type='image/png')],
+                    config=cfg,
+                )
+                raw = _safe_response_text(response)
+                if not raw:
+                    continue
+                text = raw.strip()
                 text = re.sub(r'```json\s*', '', text)
                 text = re.sub(r'```\s*', '', text)
 
@@ -1325,7 +2071,7 @@ If nothing related to this question appears on this page, return: {{}}
                         "Answer": result.get("Answer", ""),
                         "Explanation": result.get("Explanation", ""),
                         "course": "", "subjectname": "", "chapter": "", "practice": "",
-                        "subtopic": "", "medium": "Hindi" if is_hindi else "English",
+                        "subtopic": "", "medium": medium_val,
                         "difficulty": "", "question_type": "",
                         "previous_year": result.get("previous_year", ""),
                         "marks": "", "class": "", "book": "", "question_bucket": "",
@@ -1363,6 +2109,7 @@ def recover_missing_answers(pdf_path, page_results, api_key, model_name,
     targets = []
     for page_idx in range(num_pages):
         page = page_results[page_idx]
+        # ── FIX 2: also guard empty list here ──
         if not page or not _question_needs_answer(page[-1]):
             continue
         candidates = []
@@ -1381,6 +2128,9 @@ def recover_missing_answers(pdf_path, page_results, api_key, model_name,
     )
 
     for page_idx, candidate_pages in targets:
+        # ── FIX 2: guard again before accessing [-1] ──
+        if not page_results[page_idx]:
+            continue
         current_q = page_results[page_idx][-1]
         found = False
 
@@ -1472,76 +2222,153 @@ def fix_exam_field(all_questions):
 
 
 # ================================================================
+# DEDUPLICATE DIAGRAM PLACEMENTS
+# ================================================================
+def deduplicate_diagram_placements(questions: list) -> list:
+    if not questions:
+        return questions
+
+    for q in questions:
+        for field in _IMG_FIELDS:
+            if field in q and q[field]:
+                q[field] = _normalize_diagram_refs(q[field])
+
+    diagram_to_qs: dict[int, list[int]] = {}
+    for qi, q in enumerate(questions):
+        for field in _IMG_FIELDS:
+            for m in re.finditer(r'\[DIAGRAM_(\d+)\]', q.get(field, "") or ""):
+                idx = int(m.group(1))
+                diagram_to_qs.setdefault(idx, [])
+                if qi not in diagram_to_qs[idx]:
+                    diagram_to_qs[idx].append(qi)
+
+    _VISUAL_KWS = [
+        'figure', 'fig', 'diagram', 'triangle', 'circle', 'rectangle',
+        'graph', 'circuit', 'image', 'refer', 'shown', 'given', 'above',
+        'shape', 'polygon', 'coordinate', 'axis', 'chart', 'map',
+        'चित्र', 'आकृति', 'दिया', 'ग्राफ', 'आरेख',
+    ]
+
+    for idx, qi_list in diagram_to_qs.items():
+        if len(qi_list) <= 1:
+            continue
+
+        tag = f'[DIAGRAM_{idx}]'
+
+        def _score(qi):
+            q = questions[qi]
+            combined = " ".join([
+                (q.get("question", "") or ""),
+                (q.get("Explanation", "") or ""),
+            ]).lower()
+            return sum(1 for kw in _VISUAL_KWS if kw in combined)
+
+        best_qi = max(qi_list, key=_score)
+
+        for qi in qi_list:
+            if qi == best_qi:
+                continue
+            q = questions[qi]
+            for field in _IMG_FIELDS:
+                if field in q and q[field] and tag in q[field]:
+                    q[field] = q[field].replace(tag, "").strip()
+
+    return questions
+
+
+# ================================================================
 # AUTO-INJECT MISSED DIAGRAMS
 # ================================================================
 def auto_inject_missed_diagrams(questions, page_images):
     if not questions or not page_images:
         return questions
 
-    placed = set()
     for q in questions:
-        for field in ["question", "Explanation", "option1", "option2", "option3", "option4"]:
-            text = q.get(field, "") or ""
-            for m in re.finditer(r'\[DIAGRAM_(\d+)\]', text):
+        for field in _IMG_FIELDS:
+            if field in q and q[field]:
+                q[field] = _normalize_diagram_refs(q[field])
+
+    placed: set[int] = set()
+    for q in questions:
+        for field in _IMG_FIELDS:
+            for m in re.finditer(r'\[DIAGRAM_(\d+)\]', q.get(field, "") or ""):
                 placed.add(int(m.group(1)))
 
     missing = [i for i in range(len(page_images)) if i not in placed]
     if not missing:
         return questions
 
-    diagram_kws = [
-        'figure', 'fig.', 'fig ', 'diagram', 'image', 'shown', 'given', 'above', 'below',
-        'graph', 'circuit', 'structure',
-        'चित्र', 'आकृति', 'दिया गया', 'नीचे', 'ऊपर', 'आरेख', 'ग्राफ', 'परिपथ'
+    _STRONG_KWS = [
+        'figure', 'fig.', 'fig ', 'diagram', 'refer', 'shown', 'given below',
+        'given above', 'graph', 'circuit', 'image', 'picture', 'illustration',
+        'chart', 'map', 'plot', 'shape', 'triangle', 'circle', 'rectangle',
+        'polygon', 'trapezium', 'rhombus', 'coordinate', 'axis',
+        'चित्र', 'आकृति', 'दिया गया', 'नीचे दिए', 'ऊपर दिए', 'आरेख', 'ग्राफ',
     ]
+
     for idx in missing:
         tag = f'[DIAGRAM_{idx}]'
-        injected = False
         for q in questions:
             q_text = (q.get("question", "") or "").lower()
-            if any(kw in q_text for kw in diagram_kws) and tag not in (q.get("question", "") or ""):
-                q["question"] = (q.get("question", "") or "") + f"\n{tag}"
-                injected = True
-                break
-        if not injected:
-            if questions:
-                last = questions[-1]
-                last["Explanation"] = (last.get("Explanation", "") or "") + f"\n{tag}"
+            exp_text = (q.get("Explanation", "") or "").lower()
+            combined = q_text + " " + exp_text
+            if any(kw in combined for kw in _STRONG_KWS):
+                already_has = any('[DIAGRAM_' in (q.get(f, "") or "") for f in _IMG_FIELDS)
+                if not already_has:
+                    q["question"] = (q.get("question", "") or "") + f"\n{tag}"
+                    break
 
     return questions
 
 
 # ================================================================
-# ENHANCED GEMINI PAGE PROCESSOR — HINDI AWARE
+# ENHANCED GEMINI PAGE PROCESSOR
 # ================================================================
 def process_single_page(args):
     (pdf_path, page_index, page_num, api_key, model_name,
      user_subject, user_course, user_class, user_chapter, user_practice,
      user_book, section_marks_hint, skip_hashes, is_hindi) = args
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name,
-            generation_config={"response_mime_type": "application/json"}
-        )
-
+        client = genai.Client(api_key=api_key)
         img_bytes = pdf_page_to_png_bytes(pdf_path, page_index, dpi=250)
-        page_images = extract_page_embedded_images(pdf_path, page_index, skip_hashes=skip_hashes)
+        page_images = extract_all_page_images(pdf_path, page_index, skip_hashes=skip_hashes)
         num_diagrams = len(page_images)
 
         if num_diagrams > 0:
             diagram_note = (
-                f'- This page has {num_diagrams} diagram/image(s) embedded, indexed 0 to {num_diagrams - 1}.\n'
-                f'  They are provided as separate images after the page image below.\n'
-                f'  MANDATORY: Place [DIAGRAM_X] (X = index) EXACTLY at the position in the text where the diagram appears.\n'
-                f'  • If the diagram is part of the question stem → put [DIAGRAM_X] inside "question"\n'
-                f'  • If the diagram is part of an option → put [DIAGRAM_X] inside that option field\n'
-                f'  • If the diagram is in the explanation → put [DIAGRAM_X] inside "Explanation"\n'
-                f'  • If the diagram appears ABOVE the question → put [DIAGRAM_X] at the START of "question"\n'
-                f'  NEVER omit a diagram. Every diagram index 0–{num_diagrams - 1} must appear exactly once.'
+                f'+=================================================================+\n'
+                f'|  DIAGRAM RULE — {num_diagrams} IMAGE(S) — READ EVERY POINT CAREFULLY  |\n'
+                f'+=================================================================+\n\n'
+                f'I am sending you {num_diagrams} extracted image(s) AFTER the full page image.\n'
+                f'They are ordered TOP-TO-BOTTOM as they appear on the page:\n'
+                f'  [DIAGRAM_0] = topmost image on page\n'
+                + (f'  [DIAGRAM_1] = second image from top\n' if num_diagrams > 1 else '')
+                + (f'  ... up to [DIAGRAM_{num_diagrams-1}] = bottommost\n' if num_diagrams > 2 else '')
+                + f'\n'
+                f'SEQUENCE RULE (MOST IMPORTANT):\n'
+                f'  Read the page TOP to BOTTOM. Place each [DIAGRAM_X] AT THE EXACT POINT\n'
+                f'  in the text where that image physically appears on the page.\n'
+                f'  The order of [DIAGRAM_X] tags in your output MUST match reading order.\n\n'
+                f'PLACEMENT RULES:\n'
+                f'  • Image appears ABOVE question text          → [DIAGRAM_X] at very START of "question"\n'
+                f'  • Image appears IN MIDDLE of question text   → [DIAGRAM_X] inserted mid-sentence\n'
+                f'  • Image appears AFTER question, BEFORE opts  → [DIAGRAM_X] at END of "question"\n'
+                f'  • Image appears INSIDE an option             → [DIAGRAM_X] inside that option field\n'
+                f'  • Image appears in solution/working          → [DIAGRAM_X] inside "Explanation"\n\n'
+                f'EXAMPLES of correct in-sequence placement:\n'
+                f'  "question": "In the figure [DIAGRAM_0] find the perimeter of triangle ABC."\n'
+                f'  "question": "[DIAGRAM_0] The triangle shown above has sides AB=5, BC=12."\n'
+                f'  "Explanation": "From the graph [DIAGRAM_1], mode = 25, mean = 22."\n\n'
+                f'STRICT RULES:\n'
+                f'  • Use EVERY index 0–{num_diagrams-1} exactly once.\n'
+                f'  • NEVER skip a diagram. NEVER describe it in words instead of placing [DIAGRAM_X].\n'
+                f'  • NEVER move a diagram to a different question than where it appears.'
             )
         else:
-            diagram_note = '- No embedded diagrams on this page.'
+            diagram_note = (
+                'No diagrams were detected on this page.\n'
+                'If you see any figure, graph, or shape → place [DIAGRAM_0] at that position.'
+            )
 
         marks_hint_text = ""
         if section_marks_hint:
@@ -1556,7 +2383,8 @@ SECTION MARKS: ALL questions on this page carry {section_marks_hint} mark(s).
         practice_ctx = f'Practice/Exercise: "{user_practice}"' if user_practice else ""
         context_block = " | ".join(filter(None, [subject_ctx, chapter_ctx, practice_ctx]))
 
-        # ── HINDI-SPECIFIC LANGUAGE BLOCK ──
+        medium_val = "Hindi" if is_hindi else "English"
+
         if is_hindi:
             language_block = """
 ══════════════════════════════════════════════
@@ -1570,12 +2398,121 @@ MANDATORY RULES:
 3. Questions, options, explanations — ALL must be in Hindi as printed.
 4. Math formulas/numbers can remain as-is (LaTeX for equations).
 5. Field values like "question", "option1"–"option4", "Explanation" MUST be in Hindi.
-6. Only fixed system fields stay in English: "medium", "difficulty", "question_type",
+6. "subtopic" MUST also be in Hindi (e.g. "अभिक्रिया की कोटि", "गति के नियम", "घर्षण").
+7. Only fixed system fields stay in English: "difficulty", "question_type",
    "question_bucket" — these use their standard English values as defined below.
-7. If any mixed-language content exists, keep exactly as printed.
+8. If any mixed-language content exists, keep exactly as printed.
 """
         else:
             language_block = ""
+
+        if is_hindi:
+            subtopic_lang_rule = (
+                '"subtopic" must be in HINDI. Examples: "अभिक्रिया की कोटि", "गति के नियम", '
+                '"घर्षण", "विद्युत धारा", "समाकलन", "प्रकाशिकी", "ऊष्मागतिकी" etc.\n'
+                '  • Identify the specific concept/topic being tested and write it in Hindi.\n'
+                '  • NEVER write subtopic in English when medium is Hindi.'
+            )
+        else:
+            subtopic_lang_rule = (
+                '"subtopic" must be in ENGLISH. Examples: "Order of Reaction", "Laws of Motion", '
+                '"Friction", "Current Electricity", "Integration", "Optics" etc.\n'
+                '  • Identify the specific concept/topic being tested and write it in English.\n'
+                '  • NEVER write subtopic in Hindi when medium is English.'
+            )
+
+        subpart_rule = """
+══════════════════════════════════════════════
+RULE 1B — SUB-PARTS MUST STAY TOGETHER (CRITICAL — READ CAREFULLY)
+══════════════════════════════════════════════
+A question with sub-parts is ONE single question. NEVER split it into multiple JSON objects.
+
+Sub-parts include ANY of these patterns inside a question:
+  • Letters:  (a), (b), (c), (d)  OR  a., b., c., d.
+  • Roman:    (i), (ii), (iii), (iv)  OR  i., ii., iii., iv.
+  • Numbers:  (1), (2), (3), (4)  inside the question body
+
+RULE: If a question stem is followed by sub-parts using ANY of the above patterns,
+the ENTIRE question including ALL sub-parts goes into ONE JSON object.
+
+EXAMPLES of what NOT to do:
+  ✗ WRONG: Create separate JSON for "Find: (a) LCM" and separate for "(b) HCF"
+  ✓ RIGHT: ONE JSON with question = "Find: (a) LCM of ... (b) HCF of ..."
+
+  ✗ WRONG: Create separate JSON for "(i) Prove that..." and "(ii) Show that..."
+  ✓ RIGHT: ONE JSON with question = "(i) Prove that... (ii) Show that..."
+
+The Explanation field must contain answers/solutions for ALL sub-parts together.
+"""
+
+        _TH  = 'style="border:1px solid #333;padding:5px 10px;background:#dbeafe;font-weight:bold;text-align:center;vertical-align:middle"'
+        _TD  = 'style="border:1px solid #333;padding:5px 10px;text-align:center;vertical-align:middle"'
+        _TD_L = 'style="border:1px solid #333;padding:5px 10px;text-align:left;vertical-align:middle"'
+
+        table_rule = f"""
+══════════════════════════════════════════════
+RULE 8 — TABLES & STRUCTURED LAYOUTS (CRITICAL — READ EVERY LINE)
+══════════════════════════════════════════════
+
+━━━ A. LCM / HCF DIVISION LADDER — PLAIN TEXT FORMAT ━━━
+When a solution shows LCM or HCF step-by-step division, write it as PLAIN TEXT in this EXACT format:
+
+2 | 15  20  25
+  |___________
+2 | 15  10  25
+  |___________
+3 | 15   5  25
+  |___________
+5 |  5   5  25
+  |___________
+5 |  1   1   5
+  |___________
+    1   1   1
+
+STRICT RULES FOR THE LADDER:
+1. Use PLAIN TEXT only. DO NOT use HTML <table>, markdown table (|---|), or any other format.
+2. Each division step = one line: "divisor | num1  num2  num3"  (single space between numbers)
+3. After EVERY divisor row, add a separator: "  |" followed by underscores covering ALL numbers
+4. Final row (all 1s, no more divisor): indent with spaces, no pipe: "    1   1   1"
+5. Align numbers in columns using spaces so columns are vertically straight.
+6. Copy the ACTUAL numbers from the PDF exactly — replace the example 15,20,25 above.
+7. Put the ENTIRE ladder in the "Explanation" field ONLY — NEVER in "question".
+8. NEVER omit any step. Every row from the PDF must appear.
+
+Example for LCM(12, 18):
+2 | 12  18
+  |_______
+2 |  6   9
+  |_______
+3 |  3   9
+  |_______
+3 |  1   3
+  |_______
+    1   1
+
+━━━ B. GENERAL DATA / FREQUENCY TABLES ━━━
+Use HTML table (NOT plain text) for data tables, frequency tables, comparison tables:
+<table class="ltable" style="border-collapse:collapse;margin:8px 0">
+  <tr><th {_TH}>Header1</th><th {_TH}>Header2</th></tr>
+  <tr><td {_TD}>value</td><td {_TD}>value</td></tr>
+</table>
+• Preserve ALL rows and ALL columns exactly from the PDF.
+• Do NOT flatten data tables into comma-separated text.
+
+━━━ C. MATCH THE COLUMN TABLES ━━━
+Use HTML table:
+<table class="match-col ltable" style="border-collapse:collapse;margin:8px 0">
+  <tr><td style="border:1px solid #333;border-right:2px solid #555;padding:5px 10px;text-align:left">Col I item</td>
+      <td {_TD_L}>Col II item</td></tr>
+</table>
+
+━━━ D. IMAGE + TABLE SIDE-BY-SIDE ━━━
+If PDF shows an image next to a table:
+<div class="compare-wrap"><img src="..." style="max-width:45%;height:auto"><table ...>...</table></div>
+
+━━━ E. AXIS / GRAPH descriptions ━━━
+If question refers to a graph: mention axis labels in text, e.g. "x-axis: Time (s), y-axis: Distance (m)"
+"""
 
         prompt = f"""
 You are a precise question paper digitizer. Extract EVERY question from this page into a JSON array.
@@ -1587,14 +2524,46 @@ You are a precise question paper digitizer. Extract EVERY question from this pag
 {'CONTEXT: ' + context_block if context_block else ''}
 
 ══════════════════════════════════════════════
-RULE 1 — COMPLETENESS (MOST IMPORTANT)
+RULE 0 — FIELD SEPARATION (READ FIRST — MOST CRITICAL)
 ══════════════════════════════════════════════
-• Copy ALL text VERBATIM — do NOT paraphrase, summarize, or abbreviate anything.
+Each JSON field has ONE specific purpose. NEVER mix content between fields:
+
+"question"  → ONLY the question text as printed (the sentence/problem statement).
+              NEVER put options, solution steps, LCM tables, or "Sol." text here.
+"option1–4" → ONLY the answer choice text. NEVER put the question or explanation here.
+"Answer"    → ONLY the answer number (1/2/3/4) or blank.
+"Explanation" → The full solution/working: Sol. text, LCM/HCF tables, calculations, "∴ LCM = ...".
+
+⚠️ VERY COMMON MISTAKE TO AVOID:
+  ✗ WRONG: "question": "...how many soldiers? Sol. Option(4) LCM = <table>...</table>"
+  ✓ RIGHT:  "question": "...how many soldiers?"
+             "Explanation": "Sol. Option(4) LCM(15,20,25) = <table class='lcm-table'>...</table> = 300, so answer is 900"
+
+══════════════════════════════════════════════
+RULE 1 — COMPLETENESS + EXACT SEQUENCE (MOST IMPORTANT)
+══════════════════════════════════════════════
+• Copy ALL text VERBATIM — do NOT paraphrase, summarize, or skip anything.
 • Extract EVERY question on this page — do not skip even one.
 • Extract ALL option text completely — even if options are long paragraphs.
 • Extract the FULL explanation/solution — every step, every line.
-• If a table appears inside a question or option, transcribe it as plain text rows separated by \\n.
-• If a question has sub-parts (i), (ii), (iii) — include ALL sub-parts in "question".
+
+SEQUENCE RULE — CRITICAL:
+The "question" field must contain ALL parts of the question in the EXACT order they appear in the PDF.
+Text BEFORE a diagram + [DIAGRAM_X] + text AFTER the diagram — ALL go into "question" together.
+
+COMMON MISTAKE — TEXT AFTER DIAGRAM GETS DROPPED:
+  PDF shows:  [diagram]  then  "Refer to figure. Find the magnitude, x and y components."
+  ✗ WRONG: "question": "[DIAGRAM_0]"    ← drops all text after diagram!
+  ✓ RIGHT:  "question": "[DIAGRAM_0]\nRefer to figure. Find the magnitude, x and y components."
+
+  PDF shows: "Given the triangle below" then [diagram] then "Find: (a) perimeter  (b) area"
+  ✗ WRONG: "question": "Given the triangle below [DIAGRAM_0]"    ← drops sub-questions!
+  ✓ RIGHT:  "question": "Given the triangle below [DIAGRAM_0]\nFind: (a) perimeter  (b) area"
+
+RULE: After placing [DIAGRAM_X], continue reading and include ALL remaining text of that question.
+NEVER stop extracting question text just because you placed a diagram marker.
+
+{subpart_rule}
 
 ══════════════════════════════════════════════
 RULE 2 — PAGE BOUNDARIES (READ THIS CAREFULLY)
@@ -1617,17 +2586,53 @@ STEP 2 — If this page ENDS with an incomplete question (no answer/explanation 
   → Include it anyway with whatever fields are present — the system will merge it with the next page.
 
 ══════════════════════════════════════════════
-RULE 3 — DIAGRAMS
+RULE 3 — ALL VISUAL CONTENT (DIAGRAMS, GRAPHS, TABLES, CANVAS)
 ══════════════════════════════════════════════
 {diagram_note}
 
+VISUAL TYPES — every one of these must be captured with [DIAGRAM_X]:
+  • Geometric shapes   — triangle, circle, rectangle, polygon, trapezium, rhombus
+  • Graphs             — bar chart, line graph, pie chart, histogram, frequency polygon
+  • Coordinate geometry — Cartesian axes, number line, plotted points
+  • Physics diagrams   — circuit diagram, ray diagram, force diagram, pulley, spring
+  • Chemistry diagrams — lab apparatus, structural formula, molecular diagram
+  • Biology diagrams   — cell, organ, lifecycle diagram
+  • Accounts / Finance — ledger table, balance sheet diagram
+  • Drawn images       — any hand-drawn or PDF-canvas shape
+  • Venn diagrams      — overlapping circles
+  • Maps, flowcharts   — any non-text visual structure
+
 ══════════════════════════════════════════════
-RULE 4 — LATEX
+RULE 4 — LATEX (COMPLETE — EVERY MATH SYMBOL)
 ══════════════════════════════════════════════
-• Inline math  → \\\\( ... \\\\)
-• Display math → \\\\[ ... \\\\]
-• NEVER use $...$ or $$...$
-• Convert ALL mathematical expressions, fractions, superscripts, subscripts to LaTeX.
+DELIMITERS — STRICT:
+  Inline  → \\\\( ... \\\\)       e.g.  \\\\(x^2 + y^2 = r^2\\\\)
+  Display → \\\\[ ... \\\\]       e.g.  \\\\[\\\\frac{{a}}{{b}} + c\\\\]
+  NEVER use $...$ or $$...$$
+
+FRACTIONS:   \\\\(\\\\frac{{num}}{{den}}\\\\)   e.g. ½ → \\\\(\\\\frac{{1}}{{2}}\\\\)
+SQRT:        \\\\(\\\\sqrt{{x}}\\\\)  nth-root: \\\\(\\\\sqrt[n]{{x}}\\\\)
+             e.g. √2 → \\\\(\\\\sqrt{{2}}\\\\),  ³√8 → \\\\(\\\\sqrt[3]{{8}}\\\\)
+POWERS:      \\\\(x^{{2}}\\\\)  \\\\(a^{{m+n}}\\\\)  \\\\(2^{{10}}\\\\)
+SUBSCRIPT:   \\\\(x_{{1}}\\\\)  \\\\(a_{{ij}}\\\\)
+GREEK:       \\\\(\\\\alpha\\\\) \\\\(\\\\beta\\\\) \\\\(\\\\gamma\\\\) \\\\(\\\\delta\\\\)
+             \\\\(\\\\theta\\\\) \\\\(\\\\pi\\\\) \\\\(\\\\omega\\\\) \\\\(\\\\lambda\\\\)
+             \\\\(\\\\mu\\\\) \\\\(\\\\sigma\\\\) \\\\(\\\\phi\\\\) \\\\(\\\\rho\\\\)
+TRIG:        \\\\(\\\\sin\\\\theta\\\\) \\\\(\\\\cos 60^\\\\circ\\\\) \\\\(\\\\tan^{{-1}}x\\\\)
+LOG:         \\\\(\\\\log_{{2}}8\\\\)  \\\\(\\\\ln x\\\\)  \\\\(\\\\log x\\\\)
+VECTORS:     \\\\(\\\\vec{{a}}\\\\)  \\\\(\\\\overrightarrow{{AB}}\\\\)
+INTEGRAL:    \\\\[\\\\int_{{a}}^{{b}} f(x)\\\\,dx\\\\]
+SUMMATION:   \\\\[\\\\sum_{{i=1}}^{{n}} x_i\\\\]
+LIMIT:       \\\\[\\\\lim_{{x \\\\to 0}} \\\\frac{{\\\\sin x}}{{x}} = 1\\\\]
+MATRIX:      \\\\[\\\\begin{{pmatrix}} a & b \\\\\\\\ c & d \\\\end{{pmatrix}}\\\\]
+INEQUALITY:  \\\\(\\\\leq\\\\) \\\\(\\\\geq\\\\) \\\\(\\\\neq\\\\) \\\\(\\\\approx\\\\)
+ABS VALUE:   \\\\(|x|\\\\)
+INFINITY:    \\\\(\\\\infty\\\\)
+THEREFORE:   \\\\(\\\\therefore\\\\)   BECAUSE: \\\\(\\\\because\\\\)
+PLUS-MINUS:  \\\\(\\\\pm\\\\)
+DEGREE:      \\\\(90^\\\\circ\\\\)
+CHEMICAL:    H₂O → \\\\(\\\\text{{H}}_{{2}}\\\\text{{O}}\\\\)
+PERCENTAGE:  25\\\\% (escape the % sign)
 
 ══════════════════════════════════════════════
 RULE 5 — FIELD VALUES
@@ -1640,12 +2645,19 @@ Answer:
 
 Marks: single digit string only ("1","2","3","4","5") or "" if not mentioned.
 
-medium: ALWAYS use "Hindi" for this extraction.
+medium: ALWAYS use "{medium_val}" for this extraction.
 
 question_type: exactly one of:
   MCQs | True/False | Numeric | Subjective | Filling Blank |
-  Assertion and Reasoning Questions ( A & R ) |
+  Assertion and Reasoning Questions ( A& R ) |
   Match the Column Question | Case Based Questions (CBQ)
+
+FOR "Assertion and Reasoning Questions ( A& R )" — options MUST be:
+  option1: "Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A)."
+  option2: "Both Assertion (A) and Reason (R) are true but Reason (R) is NOT the correct explanation of Assertion (A)."
+  option3: "Assertion (A) is true but Reason (R) is false."
+  option4: "Assertion (A) is false but Reason (R) is true."
+  (Use EXACTLY these texts — do not leave A&R options blank)
 
 difficulty: Easy / Medium / Hard (your assessment)
 
@@ -1655,10 +2667,7 @@ question_bucket: carefully assess each question and assign exactly one of:
 ══════════════════════════════════════════════
 RULE 6 — SUBTOPIC (VERY IMPORTANT — DO NOT LEAVE BLANK)
 ══════════════════════════════════════════════
-"subtopic" must ALWAYS be filled with a meaningful value.
-  • Read the question carefully and identify the SPECIFIC concept/topic being tested.
-  • Write the subtopic in English (standard subject terminology).
-  • Examples: "Newton's Laws", "Integration by Parts", "Mole Concept", "Photosynthesis" etc.
+{subtopic_lang_rule}
   • NEVER leave subtopic as "" — always provide your best assessment.
 
 ══════════════════════════════════════════════
@@ -1673,24 +2682,26 @@ Look for patterns at END of question text or after solution:
   • Remove the reference tag from "question" field.
   • If not present → leave "previous_year" as "".
 
+{table_rule}
+
 ══════════════════════════════════════════════
 OUTPUT FORMAT — repeat for EVERY question:
 ══════════════════════════════════════════════
 {{
   "questionid": "<number as printed, or empty for continuation fragment>",
-  "question": "<complete verbatim question text{' in Hindi' if is_hindi else ''}, with LaTeX and [DIAGRAM_X] if needed — WITHOUT any reference tag>",
-  "option1": "<option A full text{' in Hindi' if is_hindi else ''}, no prefix>",
-  "option2": "<option B full text{' in Hindi' if is_hindi else ''}, no prefix>",
-  "option3": "<option C full text{' in Hindi' if is_hindi else ''}, no prefix>",
-  "option4": "<option D full text{' in Hindi' if is_hindi else ''}, no prefix>",
+  "question": "<complete verbatim question text WITH ALL SUB-PARTS (a,b,c / i,ii,iii / 1,2,3) included, with LaTeX and [DIAGRAM_X] if needed — WITHOUT any reference tag — tables as HTML>",
+  "option1": "<option A full text, no prefix>",
+  "option2": "<option B full text, no prefix>",
+  "option3": "<option C full text, no prefix>",
+  "option4": "<option D full text, no prefix>",
   "Answer": "<per rules above>",
-  "Explanation": "<complete solution — every line verbatim{' in Hindi' if is_hindi else ''}>",
+  "Explanation": "<complete solution for ALL sub-parts — every line verbatim — tables as HTML with 1px border>",
   "course": "",
   "subjectname": "",
   "chapter": "",
   "practice": "",
-  "subtopic": "<specific concept/topic being tested — NEVER leave blank — in English>",
-  "medium": "Hindi",
+  "subtopic": "<{'in Hindi' if is_hindi else 'in English'} — specific concept/topic — NEVER leave blank>",
+  "medium": "{medium_val}",
   "difficulty": "Easy/Medium/Hard",
   "question_type": "<exact type string>",
   "previous_year": "<extracted reference tag or empty>",
@@ -1704,53 +2715,66 @@ OUTPUT FORMAT — repeat for EVERY question:
 Return ONLY the JSON array. No markdown fences. No preamble. No trailing text.
 CRITICAL: Ensure all text content is properly escaped for JSON. Use \\n for newlines inside strings.
 Unicode/Devanagari characters must be included as-is (UTF-8), NOT as \\uXXXX escape sequences.
+REMEMBER:
+  1. Sub-parts (a,b,c / i,ii,iii / 1,2,3) of the SAME question = ONE JSON object. NEVER split them.
+  2. LCM/HCF division ladder → PLAIN TEXT with "divisor | numbers" rows and "  |___" separators. NEVER HTML table.
+  3. Data/frequency/match-column tables → HTML <table class="ltable"> with borders on every <td>/<th>.
+  4. medium field = "{medium_val}" always.
+  5. NEVER put ladders, solution text, or "Sol." in the "question" field — Explanation field only.
+  6. SEQUENCE: [DIAGRAM_X] tags in TOP-TO-BOTTOM order. Text BEFORE diagram → before [DIAGRAM_X]. Text AFTER diagram → after [DIAGRAM_X].
+  7. NEVER drop text that appears after a diagram. Include ALL question text: pre-diagram + [DIAGRAM_X] + post-diagram.
+  8. If a question is ONLY a diagram with a one-line instruction below it — include BOTH: "[DIAGRAM_0]\nInstruction text here"
 """
 
-        content_parts = [prompt, {'mime_type': 'image/png', 'data': img_bytes}]
+        content_parts = [prompt, genai_types.Part.from_bytes(data=img_bytes, mime_type='image/png')]
         for pi in page_images:
-            content_parts.append({
-                'mime_type': pi['mime_type'],
-                'data': base64.b64decode(pi['image_base64'])
-            })
+            content_parts.append(genai_types.Part.from_bytes(
+                data=base64.b64decode(pi['image_base64']), mime_type=pi['mime_type']
+            ))
 
         last_raw_response = None
 
-        for attempt in range(3):
+        for attempt_num, cfg in enumerate(_make_page_configs()):
+            label = f"cfg{attempt_num + 1}"
             try:
-                response = model.generate_content(content_parts)
-                last_raw_response = response.text
-                parsed = clean_json_response(response.text)
+                raw_text = _call_gemini(client, model_name, content_parts, cfg)
+                if not raw_text:
+                    print(f"  Page {page_num} [{label}]: empty — trying next")
+                    continue
+                last_raw_response = raw_text
+                print(f"  Page {page_num} [{label}]: {len(raw_text)} chars received")
+                parsed = clean_json_response(raw_text)
                 if parsed:
                     if section_marks_hint:
                         for item in parsed:
-                            existing = fix_marks_field(item.get("marks", ""))
-                            if not existing:
+                            if not fix_marks_field(item.get("marks", "")):
                                 item["marks"] = section_marks_hint
-
                     if num_diagrams > 0:
+                        parsed = deduplicate_diagram_placements(parsed)
                         parsed = auto_inject_missed_diagrams(parsed, page_images)
-
-                    expanded = []
-                    for q in parsed:
-                        q = clean_question(
+                    expanded = [
+                        clean_question(
                             q, page_images=page_images,
                             user_subject=user_subject, user_course=user_course,
                             user_class=user_class, user_chapter=user_chapter,
                             user_practice=user_practice, user_book=user_book,
                             is_hindi=is_hindi
                         )
-                        expanded.append(q)
+                        for q in parsed
+                    ]
+                    print(f"  Page {page_num}: {len(expanded)} question(s) extracted [{label}]")
                     return expanded
+                print(f"  Page {page_num} [{label}]: JSON parse failed. First 300 chars:\n{raw_text[:300]}")
                 time.sleep(1)
             except Exception as inner_e:
                 err_str = str(inner_e)
-                if "429" in err_str:
-                    time.sleep(6)
+                print(f"  Page {page_num} [{label}] ERROR: {err_str[:500]}")
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(30 * (attempt_num + 1))
                 elif "500" in err_str or "503" in err_str:
                     time.sleep(3)
                 continue
 
-        # All 3 attempts failed — ask Gemini to fix broken JSON
         if last_raw_response:
             try:
                 fix_prompt = (
@@ -1763,8 +2787,11 @@ Unicode/Devanagari characters must be included as-is (UTF-8), NOT as \\uXXXX esc
                     f"Broken JSON:\n{last_raw_response[:12000]}\n\n"
                     "Return ONLY the valid JSON array. No markdown. No explanation."
                 )
-                fix_response = model.generate_content(fix_prompt)
-                parsed = clean_json_response(fix_response.text)
+                fix_response = client.models.generate_content(
+                    model=model_name, contents=[fix_prompt],
+                    config=genai_types.GenerateContentConfig(temperature=0, max_output_tokens=65536),
+                )
+                parsed = clean_json_response(_safe_response_text(fix_response) or "")
                 if parsed:
                     print(f"✅ Page {page_num}: JSON recovered via fix-prompt ({len(parsed)} questions)")
                     if section_marks_hint:
@@ -1772,6 +2799,7 @@ Unicode/Devanagari characters must be included as-is (UTF-8), NOT as \\uXXXX esc
                             if not fix_marks_field(item.get("marks", "")):
                                 item["marks"] = section_marks_hint
                     if num_diagrams > 0:
+                        parsed = deduplicate_diagram_placements(parsed)
                         parsed = auto_inject_missed_diagrams(parsed, page_images)
                     expanded = []
                     for q in parsed:
@@ -1857,6 +2885,21 @@ if "extraction_total" not in st.session_state:
     st.session_state.extraction_total = 0
 if "extraction_file" not in st.session_state:
     st.session_state.extraction_file = None
+if "extraction_all_questions" not in st.session_state:
+    st.session_state.extraction_all_questions = None
+if "extraction_rendered_pages" not in st.session_state:
+    st.session_state.extraction_rendered_pages = {}
+
+st.markdown("""<style>
+.block-container{padding-top:0.6rem!important;padding-bottom:0!important;max-width:100%!important}
+header{visibility:hidden}
+body.live-fs [data-testid="stSidebar"]{display:none!important}
+body.live-fs header{display:none!important}
+body.live-fs .block-container{padding:0.3rem 0.6rem!important;max-width:100%!important}
+body.live-fs [data-testid="stVerticalBlockBorderWrapper"]{height:calc(100vh - 80px)!important}
+body.live-fs iframe{height:calc(100vh - 100px)!important}
+body.live-fs [data-testid="stAppViewContainer"]{overflow:hidden}
+</style>""", unsafe_allow_html=True)
 
 st.title("⚡ PDF to JSON - Complete Extraction")
 st.markdown("---")
@@ -1868,11 +2911,16 @@ with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Gemini API Key:", type="password")
     num_threads = st.slider("Threads (Concurrency)", 1, 5, 2)
-    model_choice = st.selectbox("Model", ["gemini-2.5-flash", "gemini-2.5-pro"])
+    model_choice = st.selectbox("Model", [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ])
     st.info("Threads 2-3 recommended for free tier.")
     st.markdown("---")
 
-    # ── HINDI MEDIUM TOGGLE ──
     st.subheader("🌐 Medium / Language")
     is_hindi = st.toggle("🇮🇳 Hindi Medium PDF", value=False,
                           help="Enable this if your PDF is in Hindi. All extracted text will remain in Hindi.")
@@ -1915,6 +2963,8 @@ if uploaded_file and uploaded_file.name != st.session_state.extraction_file:
     st.session_state.extraction_result = None
     st.session_state.extraction_count = 0
     st.session_state.extraction_total = 0
+    st.session_state.extraction_all_questions = None
+    st.session_state.extraction_rendered_pages = {}
 
 if any([user_subject, user_course, user_class, user_chapter, user_book]):
     with st.expander("📌 Metadata Preview", expanded=False):
@@ -1934,6 +2984,73 @@ if use_sections:
         section_configs = render_section_configurator(total_pages_hint=None)
 
 st.markdown("---")
+
+_tc1, _tc2 = st.columns([1, 4])
+with _tc1:
+    if st.button("🔌 Test API"):
+        if not api_key:
+            st.error("Enter API Key first!")
+        else:
+            with st.spinner("Testing API connection..."):
+                try:
+                    _client_test = genai.Client(api_key=api_key)
+                    _cfg_test = genai_types.GenerateContentConfig(
+                        temperature=0, max_output_tokens=20
+                    )
+                    _resp_test = _client_test.models.generate_content(
+                        model=model_choice,
+                        contents=["Say: OK"],
+                        config=_cfg_test,
+                    )
+                    _txt_test = _safe_response_text(_resp_test)
+                    if _txt_test:
+                        st.success(f"✅ API OK — Model `{model_choice}` works! Response: `{_txt_test.strip()[:60]}`")
+                    else:
+                        st.warning(f"⚠️ Connected but empty response — model may not support this config")
+                except Exception as _e:
+                    st.error(f"❌ API FAILED: {str(_e)}")
+
+st.markdown("---")
+_tp1, _tp2 = st.columns([1, 4])
+with _tp1:
+    if st.button("🧪 Test Page 1", help="Extract page 1 only and show raw response"):
+        if not api_key or not uploaded_file:
+            st.error("Need API key and PDF first!")
+        else:
+            with st.spinner("Calling Gemini on page 1..."):
+                try:
+                    import tempfile as _tf
+                    with _tf.NamedTemporaryFile(delete=False, suffix=".pdf") as _tmp:
+                        _tmp.write(uploaded_file.read())
+                        _tp = _tmp.name
+                    uploaded_file.seek(0)
+
+                    _tc = genai.Client(api_key=api_key)
+                    _img = pdf_page_to_png_bytes(_tp, 0)
+                    _cfg = genai_types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                    _r = _tc.models.generate_content(
+                        model=model_choice,
+                        contents=["Extract questions from this PDF page as a JSON array.",
+                                  genai_types.Part.from_bytes(data=_img, mime_type="image/png")],
+                        config=_cfg,
+                    )
+                    _txt = _safe_response_text(_r)
+                    if _txt:
+                        st.success(f"✅ Got {len(_txt)} chars from model")
+                        with st.expander("Raw response (first 2000 chars)", expanded=True):
+                            st.code(_txt[:2000])
+                    else:
+                        fr = "unknown"
+                        try: fr = _r.candidates[0].finish_reason
+                        except: pass
+                        st.error(f"❌ Empty response. finish_reason={fr}")
+                    import os as _os; _os.unlink(_tp)
+                except Exception as _e:
+                    st.error(f"❌ Error: {str(_e)}")
+
+st.markdown("---")
 if st.button("Start / Resume Extraction 🚀", type="primary"):
     if not api_key or not uploaded_file:
         st.error("API Key and PDF are required!")
@@ -1949,6 +3066,8 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
             st.stop()
 
     try:
+        import traceback as _tb
+
         with st.status("Phase 1: Loading PDF...") as status:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(uploaded_file.read())
@@ -1984,7 +3103,6 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
             st.info("Starting fresh extraction...")
 
         pending_indices = [i for i, r in enumerate(page_results) if r is None]
-        # NOTE: Added is_hindi to args tuple (14 elements now)
         pending_args = [
             (temp_pdf_path, i, i + 1, api_key, model_choice,
              user_subject, user_course, user_class, user_chapter, user_practice,
@@ -1992,9 +3110,90 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
             for i in pending_indices
         ]
 
+        components.html("""
+<style>
+#fsb{cursor:pointer;border:1.5px solid #6366f1;border-radius:7px;
+     padding:7px 16px;background:#f5f3ff;color:#4f46e5;
+     font-size:13px;font-weight:600;white-space:nowrap;
+     transition:all .15s;width:100%;margin-top:6px}
+#fsb:hover{background:#ede9fe;border-color:#4f46e5}
+</style>
+<script>
+function toggleFS(){
+  var body=window.parent.document.body;
+  var on=body.classList.toggle('live-fs');
+  document.getElementById('fsb').textContent=on?'⊟ Exit Full Screen':'⛶ Full Screen';
+}
+</script>
+<button id="fsb" onclick="toggleFS()">&#x26F6; Full Screen</button>
+""", height=52)
+
+        live_col_pdf, live_col_preview, live_col_json = st.columns([1, 1, 1])
+        with live_col_pdf:
+            st.markdown("**📄 Complete PDF** *(page-by-page as processed)*")
+            _pdf_placeholder = st.empty()
+            _pdf_info        = st.empty()
+        with live_col_preview:
+            st.markdown("**🔬 Preview** *(rendered LaTeX + images)*")
+            _preview_placeholder = st.empty()
+        with live_col_json:
+            st.markdown("**📋 Complete JSON**")
+            _json_placeholder = st.empty()
+            _json_info        = st.empty()
+
         progress_bar = st.progress(already_done / total_pages if total_pages else 0)
         status_text = st.empty()
         completed = already_done
+
+        _rendered_pages: dict = {}
+        _done_pages:    set   = set()
+        _page_q_counts: dict  = {}
+        live_qs: list         = []
+
+        status_text.text("Loading PDF pages…")
+        for _pi in range(total_pages):
+            try:
+                _rendered_pages[_pi] = pdf_page_to_png_bytes(temp_pdf_path, _pi, dpi=80)
+            except Exception:
+                pass
+
+        for _pi in range(total_pages):
+            if page_results[_pi] is not None:
+                _done_pages.add(_pi)
+                _page_q_counts[_pi] = sum(
+                    1 for q in page_results[_pi]
+                    if isinstance(q, dict) and "_page_error" not in q
+                )
+                for q in (page_results[_pi] or []):
+                    if isinstance(q, dict) and "_page_error" not in q:
+                        live_qs.append(q)
+
+        def _refresh_panels(current_idx=None):
+            with _pdf_placeholder.container(height=900):
+                for _pi in sorted(_rendered_pages.keys()):
+                    if _pi in _done_pages:
+                        n = _page_q_counts.get(_pi, 0)
+                        cap = f"✅ Page {_pi+1} — {n} question(s)"
+                    elif _pi == current_idx:
+                        cap = f"⏳ Page {_pi+1} — extracting…"
+                    else:
+                        cap = f"Page {_pi+1}"
+                    st.image(_rendered_pages[_pi], caption=cap, use_container_width=True)
+            done_count = len(_done_pages)
+            _pdf_info.caption(
+                f"{'✅' if done_count == total_pages else '⏳'} {done_count} / {total_pages} pages done"
+            )
+            if live_qs:
+                with _json_placeholder.container(height=900):
+                    st.code(json.dumps(live_qs, indent=2, ensure_ascii=False), language="json")
+                _json_info.caption(f"Questions so far: {len(live_qs)}")
+            else:
+                _json_placeholder.caption("*Waiting for first page…*")
+            if live_qs:
+                with _preview_placeholder.container(height=900):
+                    components.html(_build_preview_html(live_qs), height=880, scrolling=True)
+
+        _refresh_panels()
 
         if pending_args:
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
@@ -2004,12 +3203,30 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
                 }
                 for future in concurrent.futures.as_completed(future_to_index):
                     idx = future_to_index[future]
-                    result = future.result()
+                    # ── FIX 3: wrap each future result in try/except ──
+                    try:
+                        result = future.result()
+                    except Exception as _fe:
+                        print(f"⚠️ Page {idx+1} future exception: {_fe}")
+                        result = []
                     page_results[idx] = result if result else []
+                    _done_pages.add(idx)
+                    _page_q_counts[idx] = sum(
+                        1 for q in page_results[idx]
+                        if isinstance(q, dict) and "_page_error" not in q
+                    )
+                    for q in page_results[idx]:
+                        if isinstance(q, dict) and "_page_error" not in q:
+                            live_qs.append(q)
                     completed += 1
                     save_checkpoint(uploaded_file.name, page_results, total_pages)
                     progress_bar.progress(completed / total_pages)
-                    status_text.text(f"Processing page {completed}/{total_pages}...")
+                    _total_qs = sum(_page_q_counts.values())
+                    status_text.text(
+                        f"✅ Page {idx+1} done — {_page_q_counts[idx]} question(s) | "
+                        f"Total so far: {_total_qs}"
+                    )
+                    _refresh_panels(idx)
         else:
             status_text.text("All pages already processed!")
 
@@ -2039,6 +3256,7 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
                     all_questions.append(q)
 
         if all_questions:
+            all_questions = [fix_misplaced_tables(q) for q in all_questions]
             raw_count = len(all_questions)
             all_questions, duplicates_removed = final_cleanup(all_questions)
             final_count = len(all_questions)
@@ -2060,21 +3278,18 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
 
             for idx, q in enumerate(all_questions):
                 q["questionid"] = idx + 1
-                # Final force: ensure medium is correct in every question
-                q["medium"] = "Hindi" if is_hindi else q.get("medium", "English")
+                q["medium"] = "Hindi" if is_hindi else "English"
 
             all_questions = [apply_field_order(q) for q in all_questions]
 
-            # ══════════════════════════════════════════
-            # JSON DUMP — ensure_ascii=False so Hindi
-            # characters render correctly on all systems
-            # ══════════════════════════════════════════
             final_json = json.dumps(all_questions, indent=4, ensure_ascii=False)
 
             st.session_state.extraction_result = final_json
             st.session_state.extraction_count = final_count
             st.session_state.extraction_total = total_pages
             st.session_state.extraction_file = uploaded_file.name
+            st.session_state.extraction_all_questions = all_questions
+            st.session_state.extraction_rendered_pages = dict(_rendered_pages)
 
             st.success(f"✅ Extraction Complete! **{final_count} questions** extracted")
             if is_hindi:
@@ -2088,7 +3303,7 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
                 q for q in all_questions
                 if _question_needs_answer(q) and _s(q.get("question_type")) not in (
                     "Subjective", "Match the Column Question",
-                    "Assertion and Reasoning Questions ( A & R )",
+                    "Assertion and Reasoning Questions ( A& R )",
                     "Case Based Questions (CBQ)"
                 )
             ]
@@ -2096,7 +3311,7 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
                 q for q in all_questions
                 if _s(q.get("question_type")) in (
                     "Subjective", "Match the Column Question",
-                    "Assertion and Reasoning Questions ( A & R )",
+                    "Assertion and Reasoning Questions ( A& R )",
                     "Case Based Questions (CBQ)"
                 ) and not _s(q.get("Explanation"))
             ]
@@ -2164,16 +3379,77 @@ if st.button("Start / Resume Extraction 🚀", type="primary"):
                 st.rerun()
 
         else:
-            st.error("No questions found. Check if the PDF contains readable text.")
+            st.error("No questions found. Delete checkpoint from sidebar and try again.")
+            st.info("💡 Sidebar → Checkpoint Manager → Delete All Checkpoints → then re-extract.")
+            with st.expander("🔍 Debug — Page 1 API test", expanded=True):
+                try:
+                    import tempfile as _tf2
+                    with _tf2.NamedTemporaryFile(delete=False, suffix=".pdf") as _tmp2:
+                        uploaded_file.seek(0)
+                        _tmp2.write(uploaded_file.read())
+                        _dbg_path = _tmp2.name
+                    uploaded_file.seek(0)
+                    _dbg_client = genai.Client(api_key=api_key)
+                    _dbg_img    = pdf_page_to_png_bytes(_dbg_path, 0)
+                    _dbg_cfg    = genai_types.GenerateContentConfig(
+                        temperature=0, max_output_tokens=512)
+                    _dbg_resp   = _dbg_client.models.generate_content(
+                        model=model_choice,
+                        contents=["Describe what you see in this image in 2 sentences.",
+                                  genai_types.Part.from_bytes(data=_dbg_img, mime_type="image/png")],
+                        config=_dbg_cfg,
+                    )
+                    _dbg_txt = _safe_response_text(_dbg_resp)
+                    import os as _os2; _os2.unlink(_dbg_path)
+                    if _dbg_txt:
+                        st.success(f"✅ Model sees the page. Response:\n\n{_dbg_txt}")
+                    else:
+                        st.error("Model returned empty — API or model issue.")
+                except Exception as _dbg_e:
+                    st.error(f"Debug failed: {_dbg_e}")
+
             if st.button("🔄 Retry Extraction", type="primary"):
                 st.session_state.extraction_result = None
                 delete_checkpoint(uploaded_file.name)
                 st.rerun()
 
     except Exception as global_error:
+        # ── FIX 4: show full traceback so exact line is visible in logs ──
+        import traceback as _tb
+        _tb_str = _tb.format_exc()
+        print(_tb_str)
         st.error(f"Fatal Error: {str(global_error)}")
+        st.code(_tb_str, language="python")
         st.warning("Progress has been saved. Click 'Start / Resume' to continue.")
 
+
+# ================================================================
+# PERSISTENT RESULT PANELS
+# ================================================================
+_pr_qs    = st.session_state.get("extraction_all_questions")
+_pr_json  = st.session_state.get("extraction_result")
+_pr_pages = st.session_state.get("extraction_rendered_pages", {})
+_pr_same  = (st.session_state.extraction_file == (uploaded_file.name if uploaded_file else None))
+
+if _pr_qs and _pr_json and _pr_same:
+    st.markdown("---")
+    _pr_col_pdf, _pr_col_prev, _pr_col_json = st.columns([1, 1, 1])
+    with _pr_col_pdf:
+        st.markdown("**📄 PDF Pages**")
+        with st.container(height=900):
+            if _pr_pages:
+                for _pi in sorted(_pr_pages.keys()):
+                    st.image(_pr_pages[_pi], caption=f"Page {_pi+1}", use_container_width=True)
+            else:
+                st.caption("PDF thumbnails not available")
+    with _pr_col_prev:
+        st.markdown("**🔬 Preview**")
+        with st.container(height=900):
+            components.html(_build_preview_html(_pr_qs), height=880, scrolling=True)
+    with _pr_col_json:
+        st.markdown("**📋 Final JSON**")
+        with st.container(height=900):
+            st.code(_pr_json, language="json")
 
 # ================================================================
 # PERSISTENT DOWNLOAD SECTION
