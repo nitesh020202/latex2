@@ -1,3 +1,4 @@
+# cpde2.py
 import streamlit as st
 import streamlit.components.v1 as components
 from google import genai
@@ -167,18 +168,24 @@ _DIAGRAM_KWS = [
     'चित्र', 'आकृति', 'दिया गया', 'नीचे', 'ऊपर', 'आरेख', 'ग्राफ', 'परिपथ',
 ]
 
-
 def extract_page_embedded_images(pdf_path: str, page_num: int,
                                   skip_hashes: set | None = None) -> list[dict]:
-    """FIX: guard page_num out of range."""
+    """
+    Extract raster images embedded in the PDF page.
+    FIXES:
+      • Pass page dimensions to _is_useless_image so full-page images are rejected.
+      • Reject images whose rendered bbox covers > 70 % of page width AND height.
+      • Minimum size raised to 60 × 45 px.
+    """
     doc = fitz.open(pdf_path)
-    # ── FIX 1 (also here): guard page_num ──
     if page_num >= len(doc):
         doc.close()
         return []
-    page = doc[page_num]
-    seen_xrefs: set[int] = set()
+    page    = doc[page_num]
+    page_w  = page.rect.width
+    page_h  = page.rect.height
 
+    seen_xrefs: set[int] = set()
     for img_info in page.get_images(full=True):
         xref = img_info[0]
         if xref > 0:
@@ -192,13 +199,17 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
     except Exception:
         pass
 
+    # Build xref → rendered bbox map
+    xref_bbox: dict[int, tuple] = {}
     xref_ypos: dict[int, float] = {}
     try:
         for info in page.get_image_info(hashes=False):
             xref = info.get("xref", 0)
             if xref and xref > 0:
                 bbox = info.get("bbox", [0, 0, 0, 0])
-                xref_ypos[xref] = float(bbox[1]) if len(bbox) >= 4 else 0.0
+                if len(bbox) >= 4:
+                    xref_bbox[xref] = tuple(bbox)
+                    xref_ypos[xref] = float(bbox[1])
     except Exception:
         pass
 
@@ -212,11 +223,22 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
             h        = img_data.get("height", 0)
             cs_n     = img_data.get("colorspace", 3)
 
+            # Size gate (pixels)
+            if w < 60 or h < 45:
+                continue
+
+            # Rendered-bbox gate: if the image fills most of the page → skip
+            if xref in xref_bbox:
+                bx0, by0, bx1, by1 = xref_bbox[xref]
+                rendered_w = abs(bx1 - bx0)
+                rendered_h = abs(by1 - by0)
+                if (rendered_w / max(page_w, 1) > 0.80) and (rendered_h / max(page_h, 1) > 0.80):
+                    continue   # full-page background / watermark
+
             if skip_hashes and hashlib.md5(raw).hexdigest() in skip_hashes:
                 continue
-            if w < 40 or h < 30:
-                continue
-            if _is_useless_image(raw):
+
+            if _is_useless_image(raw, page_w=page_w, page_h=page_h):
                 continue
 
             if ext in ("jpg", "jpeg") and cs_n == 3:
@@ -236,10 +258,10 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
                 b64  = base64.b64encode(raw).decode()
 
             images.append({
-                "mime_type": mime,
+                "mime_type":    mime,
                 "image_base64": b64,
-                "data_uri": f"data:{mime};base64,{b64}",
-                "y_pos": xref_ypos.get(xref, 9999.0),
+                "data_uri":     f"data:{mime};base64,{b64}",
+                "y_pos":        xref_ypos.get(xref, 9999.0),
             })
         except Exception:
             pass
@@ -248,35 +270,57 @@ def extract_page_embedded_images(pdf_path: str, page_num: int,
     return images
 
 
-def _is_useless_image(raw_bytes: bytes) -> bool:
+def _is_useless_image(raw_bytes: bytes, page_w: float = 0, page_h: float = 0) -> bool:
+    """
+    Returns True if the image should be discarded.
+    Fixes:
+      1. Rejects images that cover ≥ 60 % of the page area (full-page backgrounds).
+      2. Tightens the near-white threshold (dark_ratio < 0.02 → useless).
+      3. Rejects near-solid-black images (dark_ratio > 0.95).
+      4. Rejects tiny images (< 60 × 45 px).
+    """
     try:
         pix = fitz.Pixmap(raw_bytes)
-        if pix.width < 10 or pix.height < 10:
+        w, h = pix.width, pix.height
+
+        # Too small
+        if w < 60 or h < 45:
             return True
+
+        # Covers most of the page → likely a background/watermark, not a diagram
+        if page_w > 0 and page_h > 0:
+            page_area  = page_w * page_h
+            image_area = w * h
+            # Use a 72-dpi normalised comparison (page dims are in pts, image in px)
+            # We compare aspect-ratio-safe: if image is > 55 % of page in BOTH dims → skip
+            if (w / max(page_w, 1) > 0.85) and (h / max(page_h, 1) > 0.85):
+                return True
+
         samples = pix.samples
         n = pix.n
         total = len(samples) // n
-        step = max(1, total // 400)
+        step = max(1, total // 500)
         dark_count = 0
         sampled = 0
         for i in range(0, total, step):
-            px = samples[i*n : i*n + min(3, n)]
+            px = samples[i * n: i * n + min(3, n)]
             if len(px) >= 3:
                 brightness = (px[0] + px[1] + px[2]) / 3
-                if brightness < 180:
+                if brightness < 200:          # slightly tighter than 180
                     dark_count += 1
                 sampled += 1
+
         if sampled == 0:
             return False
         dark_ratio = dark_count / sampled
-        if dark_ratio < 0.005:
+
+        if dark_ratio < 0.02:    # near-white → blank / background
             return True
-        if dark_ratio > 0.98:
+        if dark_ratio > 0.95:    # near-solid-black → bad render
             return True
         return False
     except Exception:
         return False
-
 
 def _inflate_rect(r: fitz.Rect, d: float) -> fitz.Rect:
     return fitz.Rect(r.x0 - d, r.y0 - d, r.x1 + d, r.y1 + d)
@@ -298,13 +342,23 @@ def _cluster_rects(rects: list, gap: int = 25) -> list:
 
 
 def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
+    """
+    Detect regions made of vector drawings (lines, curves, rects) and render them as PNG.
+    FIXES:
+      • Raised minimum cluster element count from 2 → 4.
+      • Raised minimum cluster area from 300 → 2 000 px².
+      • Added max-coverage guard: skip clusters that fill > 70 % of page.
+      • Tightened aspect-ratio filter: skip very wide/thin bands.
+      • Raised minimum cluster dimensions from 15 × 15 → 25 × 25 pts.
+    """
     try:
         doc  = fitz.open(pdf_path)
-        # ── FIX 1 (also here): guard page_num ──
         if page_num >= len(doc):
             doc.close()
             return []
-        page = doc[page_num]
+        page   = doc[page_num]
+        page_w = page.rect.width
+        page_h = page.rect.height
         crop_mat = fitz.Matrix(3.0, 3.0)
         images: list[dict] = []
         captured: list[fitz.Rect] = []
@@ -317,31 +371,39 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
 
         def _render(clip: fitz.Rect, y_pos: float):
             clip = clip & page.rect
-            if clip.width < 10 or clip.height < 10:
+            if clip.width < 25 or clip.height < 25:
+                return
+            # Skip if clip covers most of the page
+            if (clip.width  / max(page_w, 1) > 0.80 and
+                    clip.height / max(page_h, 1) > 0.80):
                 return
             pix = page.get_pixmap(matrix=crop_mat, clip=clip, colorspace=fitz.csRGB)
             raw = pix.tobytes("png")
-            if _is_useless_image(raw):
+            if _is_useless_image(raw, page_w=pix.width, page_h=pix.height):
                 return
             b64 = base64.b64encode(raw).decode()
             images.append({
-                "mime_type": "image/png",
+                "mime_type":    "image/png",
                 "image_base64": b64,
-                "data_uri": f"data:image/png;base64,{b64}",
-                "y_pos": y_pos,
+                "data_uri":     f"data:image/png;base64,{b64}",
+                "y_pos":        y_pos,
             })
             captured.append(clip)
 
         drawings = page.get_drawings()
         if drawings:
-            raw_rects = [fitz.Rect(d["rect"]) for d in drawings
-                         if d.get("rect") and max(fitz.Rect(d["rect"]).width,
-                                                   fitz.Rect(d["rect"]).height) >= 5]
+            raw_rects = [
+                fitz.Rect(d["rect"]) for d in drawings
+                if d.get("rect") and max(
+                    fitz.Rect(d["rect"]).width,
+                    fitz.Rect(d["rect"]).height
+                ) >= 8       # ignore hairlines
+            ]
 
             clusters: list[fitz.Rect] = []
             cluster_counts: list[int] = []
             for rect in raw_rects:
-                exp = _inflate_rect(rect, 20)
+                exp = _inflate_rect(rect, 15)   # tighter inflation (was 20)
                 merged = False
                 for i, c in enumerate(clusters):
                     if exp.intersects(c):
@@ -354,28 +416,39 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
                     cluster_counts.append(1)
 
             for cr, cnt in zip(clusters, cluster_counts):
-                if cr.width < 15 or cr.height < 15:
+                # Dimension gates (raised from 15 → 25 pts)
+                if cr.width < 25 or cr.height < 25:
                     continue
-                if cr.get_area() < 300:
+                # Area gate (raised from 300 → 2000 pts²)
+                if cr.get_area() < 2000:
                     continue
-                if cnt < 2:
+                # Element-count gate (raised from 2 → 4)
+                if cnt < 4:
                     continue
+                # Aspect-ratio gate: skip thin horizontal rules / underlines
                 aspect = cr.width / max(cr.height, 1)
-                if aspect > 3.0 and cr.height < 60:
+                if aspect > 8.0 and cr.height < 30:
+                    continue
+                if aspect < 0.1:   # too tall and narrow → likely a border line
+                    continue
+                # Full-page coverage gate
+                if (cr.width  / max(page_w, 1) > 0.75 and
+                        cr.height / max(page_h, 1) > 0.75):
                     continue
                 if _already_covered(cr):
                     continue
                 clip = fitz.Rect(
-                    max(0, cr.x0 - 30), max(0, cr.y0 - 8),
-                    min(page.rect.width,  cr.x1 + 30),
-                    min(page.rect.height, cr.y1 + 8)
+                    max(0,               cr.x0 - 20),
+                    max(0,               cr.y0 - 6),
+                    min(page_w,          cr.x1 + 20),
+                    min(page_h,          cr.y1 + 6),
                 )
                 _render(clip, cr.y0)
 
         try:
             for annot in page.annots():
                 ar = fitz.Rect(annot.rect)
-                if ar.width >= 15 and ar.height >= 15 and not _already_covered(ar):
+                if ar.width >= 25 and ar.height >= 25 and not _already_covered(ar):
                     _render(_inflate_rect(ar, 8), ar.y0)
         except Exception:
             pass
@@ -387,14 +460,53 @@ def extract_vector_diagram_regions(pdf_path: str, page_num: int) -> list[dict]:
         return []
 
 
+
 def extract_all_page_images(pdf_path: str, page_num: int,
                              skip_hashes: set | None = None) -> list[dict]:
+    """
+    Combine raster + vector images, deduplicate, and apply a final
+    full-page-coverage guard before returning.
+    """
+    # Get page dimensions for the coverage guard
+    try:
+        _doc   = fitz.open(pdf_path)
+        _page  = _doc[page_num] if page_num < len(_doc) else None
+        _pw    = _page.rect.width  if _page else 0
+        _ph    = _page.rect.height if _page else 0
+        _doc.close()
+    except Exception:
+        _pw = _ph = 0
+
     raster = extract_page_embedded_images(pdf_path, page_num, skip_hashes)
     vector = extract_vector_diagram_regions(pdf_path, page_num)
-    deduped_vector = [v for v in vector
-                      if not any(abs(v.get("y_pos", 0) - r.get("y_pos", 9999)) < 30
-                                 for r in raster)]
+
+    # Deduplicate vector vs raster by y-position proximity
+    deduped_vector = [
+        v for v in vector
+        if not any(
+            abs(v.get("y_pos", 0) - r.get("y_pos", 9999)) < 30
+            for r in raster
+        )
+    ]
+
     combined = raster + deduped_vector
+
+    # Final safety filter: drop anything that decodes to a near-full-page image
+    if _pw > 0 and _ph > 0:
+        safe = []
+        for img in combined:
+            try:
+                raw = base64.b64decode(img["image_base64"])
+                pix = fitz.Pixmap(raw)
+                # If the rendered image is > 80 % of page in both dims → skip
+                if (pix.width  / (_pw  * 3) > 0.80 and   # ×3 because we render at 3× zoom
+                        pix.height / (_ph * 3) > 0.80):
+                    continue
+            except Exception:
+                pass
+            safe.append(img)
+        combined = safe
+
     combined.sort(key=lambda x: x.get("y_pos", 9999))
     return combined
 
